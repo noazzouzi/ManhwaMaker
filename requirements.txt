@@ -1,0 +1,26 @@
+# Auto-Manhwa Recap Generator — Python 3.11+ (3.12 recommandé pour Kokoro/torch)
+
+# --- Image ---
+opencv-python>=4.9,<5
+numpy>=1.26,<3
+pillow>=10.2
+
+# --- Scraping ---
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0            # parser rapide pour BeautifulSoup
+
+# --- VLM / LLM ---
+google-genai>=1.0
+
+# --- TTS (local) ---
+kokoro>=0.9.4        # installe torch + misaki ; espeak-ng requis pour certaines langues
+soundfile>=0.12
+pydub>=0.25          # nécessite ffmpeg dans le PATH
+
+# --- CLI / schémas ---
+typer>=0.12
+pydantic>=2.6
+
+# --- Dev / tests (optionnel) ---
+pytest>=8.0

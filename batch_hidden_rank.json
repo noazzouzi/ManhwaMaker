@@ -1,0 +1,409 @@
+{
+  "created": "2026-09-12T11:45:50+02:00",
+  "updated": "2026-09-12T18:53:00+02:00",
+  "chapters": {
+    "https://www.webtoons.com/en/action/the-unparalleled-hidden-rank-equipment/ep-1-the-baptism-ceremony-/viewer?title_no=7358&episode_no=1": {
+      "status": "done",
+      "attempts": 2,
+      "stage": "done",
+      "out_dir": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep1",
+      "started": "2026-09-12T18:48:53+02:00",
+      "finished": "2026-09-12T18:49:46+02:00",
+      "error": null,
+      "updated": "2026-09-12T18:49:46+02:00",
+      "episode_no": 1,
+      "title": "The Unparalleled Hidden Rank Equipment - Ep. 1 - The Baptism Ceremony",
+      "n_panels": 118,
+      "model": "gemini-3.5-flash",
+      "n_scenes": 17,
+      "voice_s": 454.2,
+      "duration_s": 52.9,
+      "preview": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep1\\preview_60s.mp4",
+      "capcut": "C:\\Users\\Nouamane\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft\\The Unparalleled Hidden Rank Equipment - Ep. 1 - The Baptism Ceremony",
+      "total_duration_s": 454.2,
+      "timings": {
+        "scrape+slice": 0.0,
+        "analyze": 0.0,
+        "tts": 0.0,
+        "timeline": 0.0,
+        "capcut": 1.1,
+        "preview": 51.7
+      },
+      "gemini_s": 0.0,
+      "reused": [
+        "scrape+slice",
+        "analyze",
+        "tts"
+      ]
+    },
+    "https://www.webtoons.com/en/action/the-unparalleled-hidden-rank-equipment/ep-2-hidden-equipment-1-/viewer?title_no=7358&episode_no=2": {
+      "status": "done",
+      "attempts": 2,
+      "stage": "done",
+      "out_dir": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep2",
+      "started": "2026-09-12T18:48:53+02:00",
+      "finished": "2026-09-12T18:49:42+02:00",
+      "error": null,
+      "updated": "2026-09-12T18:49:42+02:00",
+      "episode_no": 2,
+      "title": "The Unparalleled Hidden Rank Equipment - Ep. 2 - Hidden Equipment #1",
+      "n_panels": 127,
+      "model": "gemini-3.5-flash",
+      "n_scenes": 18,
+      "voice_s": 517.7,
+      "duration_s": 49.7,
+      "preview": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep2\\preview_60s.mp4",
+      "capcut": "C:\\Users\\Nouamane\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft\\The Unparalleled Hidden Rank Equipment - Ep. 2 - Hidden Equipment #1",
+      "total_duration_s": 517.7,
+      "timings": {
+        "scrape+slice": 0.0,
+        "analyze": 0.0,
+        "tts": 0.0,
+        "timeline": 0.0,
+        "capcut": 2.7,
+        "preview": 46.9
+      },
+      "gemini_s": 0.0,
+      "reused": [
+        "scrape+slice",
+        "analyze",
+        "tts"
+      ]
+    },
+    "https://www.webtoons.com/en/action/the-unparalleled-hidden-rank-equipment/ep-3-the-woodsmans-forest-1-/viewer?title_no=7358&episode_no=3": {
+      "status": "done",
+      "attempts": 2,
+      "stage": "done",
+      "out_dir": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep3",
+      "started": "2026-09-12T18:48:53+02:00",
+      "finished": "2026-09-12T18:50:35+02:00",
+      "error": null,
+      "updated": "2026-09-12T18:50:35+02:00",
+      "episode_no": 3,
+      "title": "The Unparalleled Hidden Rank Equipment - Ep. 3 - The Woodsman's Forest (1)",
+      "n_panels": 109,
+      "model": "gemini-3.5-flash",
+      "n_scenes": 16,
+      "voice_s": 481.0,
+      "duration_s": 102.6,
+      "preview": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep3\\preview_60s.mp4",
+      "capcut": "C:\\Users\\Nouamane\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft\\The Unparalleled Hidden Rank Equipment - Ep. 3 - The Woodsman's Forest (1)",
+      "total_duration_s": 481.0,
+      "timings": {
+        "scrape+slice": 0.0,
+        "analyze": 0.0,
+        "tts": 0.0,
+        "timeline": 0.0,
+        "capcut": 1.4,
+        "preview": 51.6
+      },
+      "gemini_s": 0.0,
+      "reused": [
+        "scrape+slice",
+        "analyze",
+        "tts"
+      ]
+    },
+    "https://www.webtoons.com/en/action/the-unparalleled-hidden-rank-equipment/ep-4-the-woodsmans-forest-2-/viewer?title_no=7358&episode_no=4": {
+      "status": "done",
+      "attempts": 5,
+      "stage": "done",
+      "out_dir": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep4",
+      "started": "2026-09-12T18:48:53+02:00",
+      "finished": "2026-09-12T18:50:36+02:00",
+      "error": null,
+      "updated": "2026-09-12T18:50:36+02:00",
+      "episode_no": 4,
+      "title": "The Unparalleled Hidden Rank Equipment - Ep. 4 - The Woodsman's Forest (2)",
+      "n_panels": 134,
+      "model": "gemini-3.5-flash",
+      "n_scenes": 19,
+      "voice_s": 581.7,
+      "duration_s": 103.2,
+      "preview": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep4\\preview_60s.mp4",
+      "capcut": "C:\\Users\\Nouamane\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft\\The Unparalleled Hidden Rank Equipment - Ep. 4 - The Woodsman's Forest (2)",
+      "total_duration_s": 581.7,
+      "timings": {
+        "scrape+slice": 0.0,
+        "analyze": 0.0,
+        "tts": 0.0,
+        "timeline": 0.0,
+        "capcut": 1.8,
+        "preview": 48.5
+      },
+      "gemini_s": 0.0,
+      "reused": [
+        "scrape+slice",
+        "analyze",
+        "tts"
+      ]
+    },
+    "https://www.webtoons.com/en/action/the-unparalleled-hidden-rank-equipment/ep-5-the-woodsmans-forest-3/viewer?title_no=7358&episode_no=5": {
+      "status": "done",
+      "attempts": 2,
+      "stage": "done",
+      "out_dir": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep5",
+      "started": "2026-09-12T18:48:53+02:00",
+      "finished": "2026-09-12T18:51:19+02:00",
+      "error": null,
+      "updated": "2026-09-12T18:51:19+02:00",
+      "episode_no": 5,
+      "title": "The Unparalleled Hidden Rank Equipment - Ep. 5 - The Woodsman's Forest (3)",
+      "n_panels": 108,
+      "model": "gemini-3.5-flash",
+      "n_scenes": 18,
+      "voice_s": 533.1,
+      "duration_s": 146.3,
+      "preview": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep5\\preview_60s.mp4",
+      "capcut": "C:\\Users\\Nouamane\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft\\The Unparalleled Hidden Rank Equipment - Ep. 5 - The Woodsman's Forest (3)",
+      "total_duration_s": 533.1,
+      "timings": {
+        "scrape+slice": 0.0,
+        "analyze": 0.0,
+        "tts": 0.0,
+        "timeline": 0.0,
+        "capcut": 1.2,
+        "preview": 42.5
+      },
+      "gemini_s": 0.0,
+      "reused": [
+        "scrape+slice",
+        "analyze",
+        "tts"
+      ]
+    },
+    "https://www.webtoons.com/en/action/the-unparalleled-hidden-rank-equipment/ep-6-the-wolfpack-guild-1-/viewer?title_no=7358&episode_no=6": {
+      "status": "done",
+      "attempts": 2,
+      "stage": "done",
+      "out_dir": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep6",
+      "started": "2026-09-12T18:48:53+02:00",
+      "finished": "2026-09-12T18:52:02+02:00",
+      "error": null,
+      "updated": "2026-09-12T18:52:02+02:00",
+      "episode_no": 6,
+      "title": "The Unparalleled Hidden Rank Equipment - Ep. 6 - The Wolfpack Guild (1)",
+      "n_panels": 166,
+      "model": "gemini-3.5-flash",
+      "n_scenes": 24,
+      "voice_s": 623.6,
+      "duration_s": 189.1,
+      "preview": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep6\\preview_60s.mp4",
+      "capcut": "C:\\Users\\Nouamane\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft\\The Unparalleled Hidden Rank Equipment - Ep. 6 - The Wolfpack Guild (1)",
+      "total_duration_s": 623.6,
+      "timings": {
+        "scrape+slice": 0.0,
+        "analyze": 0.0,
+        "tts": 0.0,
+        "timeline": 0.0,
+        "capcut": 2.0,
+        "preview": 40.7
+      },
+      "gemini_s": 0.0,
+      "reused": [
+        "scrape+slice",
+        "analyze",
+        "tts"
+      ]
+    },
+    "https://www.webtoons.com/en/action/the-unparalleled-hidden-rank-equipment/ep-7-the-wolfpack-guild-2/viewer?title_no=7358&episode_no=7": {
+      "status": "done",
+      "attempts": 2,
+      "stage": "done",
+      "out_dir": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep7",
+      "started": "2026-09-12T18:48:53+02:00",
+      "finished": "2026-09-12T18:51:28+02:00",
+      "error": null,
+      "updated": "2026-09-12T18:51:28+02:00",
+      "episode_no": 7,
+      "title": "The Unparalleled Hidden Rank Equipment - Ep. 7 - The Wolfpack Guild (2)",
+      "n_panels": 114,
+      "model": "gemini-3.5-flash",
+      "n_scenes": 16,
+      "voice_s": 470.8,
+      "duration_s": 154.7,
+      "preview": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep7\\preview_60s.mp4",
+      "capcut": "C:\\Users\\Nouamane\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft\\The Unparalleled Hidden Rank Equipment - Ep. 7 - The Wolfpack Guild (2)",
+      "total_duration_s": 470.8,
+      "timings": {
+        "scrape+slice": 0.0,
+        "analyze": 0.0,
+        "tts": 0.0,
+        "timeline": 0.0,
+        "capcut": 2.1,
+        "preview": 49.4
+      },
+      "gemini_s": 0.0,
+      "reused": [
+        "scrape+slice",
+        "analyze",
+        "tts"
+      ]
+    },
+    "https://www.webtoons.com/en/action/the-unparalleled-hidden-rank-equipment/ep-8-the-wolfpack-guild-3/viewer?title_no=7358&episode_no=8": {
+      "status": "done",
+      "attempts": 2,
+      "stage": "done",
+      "out_dir": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep8",
+      "started": "2026-09-12T18:48:53+02:00",
+      "finished": "2026-09-12T18:52:17+02:00",
+      "error": null,
+      "updated": "2026-09-12T18:52:17+02:00",
+      "episode_no": 8,
+      "title": "The Unparalleled Hidden Rank Equipment - Ep. 8 - The Wolfpack Guild (3)",
+      "n_panels": 114,
+      "model": "gemini-3.5-flash",
+      "n_scenes": 16,
+      "voice_s": 466.1,
+      "duration_s": 203.9,
+      "preview": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep8\\preview_60s.mp4",
+      "capcut": "C:\\Users\\Nouamane\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft\\The Unparalleled Hidden Rank Equipment - Ep. 8 - The Wolfpack Guild (3)",
+      "total_duration_s": 466.1,
+      "timings": {
+        "scrape+slice": 0.0,
+        "analyze": 0.0,
+        "tts": 0.0,
+        "timeline": 0.0,
+        "capcut": 1.3,
+        "preview": 47.9
+      },
+      "gemini_s": 0.0,
+      "reused": [
+        "scrape+slice",
+        "analyze",
+        "tts"
+      ]
+    },
+    "https://www.webtoons.com/en/action/the-unparalleled-hidden-rank-equipment/ep-9-hidden-equipment-2-/viewer?title_no=7358&episode_no=9": {
+      "status": "done",
+      "attempts": 2,
+      "stage": "done",
+      "out_dir": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep9",
+      "started": "2026-09-12T18:48:53+02:00",
+      "finished": "2026-09-12T18:52:55+02:00",
+      "error": null,
+      "updated": "2026-09-12T18:52:55+02:00",
+      "episode_no": 9,
+      "title": "The Unparalleled Hidden Rank Equipment - Ep. 9 - Hidden Equipment #2",
+      "n_panels": 147,
+      "model": "gemini-3.5-flash",
+      "n_scenes": 27,
+      "voice_s": 673.3,
+      "duration_s": 242.6,
+      "preview": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep9\\preview_60s.mp4",
+      "capcut": "C:\\Users\\Nouamane\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft\\The Unparalleled Hidden Rank Equipment - Ep. 9 - Hidden Equipment #2",
+      "total_duration_s": 673.3,
+      "timings": {
+        "scrape+slice": 0.0,
+        "analyze": 0.0,
+        "tts": 0.0,
+        "timeline": 0.0,
+        "capcut": 2.0,
+        "preview": 51.5
+      },
+      "gemini_s": 0.0,
+      "reused": [
+        "scrape+slice",
+        "analyze",
+        "tts"
+      ]
+    },
+    "https://www.webtoons.com/en/action/the-unparalleled-hidden-rank-equipment/ep-10-mount-agni-1-/viewer?title_no=7358&episode_no=10": {
+      "status": "done",
+      "attempts": 5,
+      "stage": "done",
+      "out_dir": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep10",
+      "started": "2026-09-12T18:48:53+02:00",
+      "finished": "2026-09-12T18:53:00+02:00",
+      "error": null,
+      "updated": "2026-09-12T18:53:00+02:00",
+      "episode_no": 10,
+      "title": "The Unparalleled Hidden Rank Equipment - Ep. 10 - Mount Agni (1)",
+      "n_panels": 158,
+      "model": "gemini-3.5-flash",
+      "n_scenes": 23,
+      "voice_s": 570.1,
+      "duration_s": 247.5,
+      "preview": "C:\\Users\\Nouamane\\Documents\\ManhwaMaker\\output\\the-unparalleled-hidden-rank-equipment_ep10\\preview_60s.mp4",
+      "capcut": "C:\\Users\\Nouamane\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft\\The Unparalleled Hidden Rank Equipment - Ep. 10 - Mount Agni (1)",
+      "total_duration_s": 570.1,
+      "timings": {
+        "scrape+slice": 0.0,
+        "analyze": 0.0,
+        "tts": 0.0,
+        "timeline": 0.0,
+        "capcut": 1.6,
+        "preview": 41.9
+      },
+      "gemini_s": 0.0,
+      "reused": [
+        "scrape+slice",
+        "analyze",
+        "tts"
+      ]
+    }
+  },
+  "gemini": {
+    "model": "gemini-3.5-flash",
+    "models": [
+      "gemini-3.5-flash",
+      "gemini-3.6-flash",
+      "gemini-3.7-flash",
+      "gemini-3.8-flash",
+      "gemini-2.5-flash",
+      "gemini-3.5-flash-lite",
+      "gemini-3.1-flash-lite",
+      "gemini-2.5-flash-lite",
+      "gemini-pro-latest"
+    ],
+    "active_key": "cle #1 (...oywg)",
+    "keys": [
+      {
+        "label": "cle #1 (...oywg)",
+        "invalid": false,
+        "exhausted_models": [],
+        "calls": 0,
+        "failures": 0
+      }
+    ],
+    "calls": 0,
+    "rotations": 0,
+    "cascades": 0,
+    "rpm_wait_s": 0.0,
+    "latency_s": {
+      "n": 0,
+      "mean": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "max": 0.0,
+      "total": 0
+    },
+    "calls_by_model": {}
+  },
+  "run": {
+    "finished": "2026-09-12T18:53:00+02:00",
+    "elapsed_s": 247.5,
+    "chapters": 10,
+    "done": 10,
+    "failed": 0,
+    "skipped": 0,
+    "timings": {
+      "n_chapters": 10,
+      "n_measured": 0,
+      "n_reused": 10,
+      "steps": {},
+      "chapter_median_s": 0.0,
+      "chapter_min_s": 0.0,
+      "chapter_max_s": 0.0,
+      "video_median_s": 0.0,
+      "compute_per_video_second": 0.0
+    },
+    "parallelism": {
+      "max_chapters": 4,
+      "max_gemini_rpm": 10,
+      "max_tts_workers": 2,
+      "max_render_workers": 2,
+      "max_scrape_workers": 4
+    }
+  }
+}

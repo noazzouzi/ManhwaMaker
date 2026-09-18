@@ -1,0 +1,16 @@
+{
+  "_comment": "Dictionnaire de remplacement phonetique applique avant la synthese Kokoro. Cle = nom propre tel qu'il apparait dans la narration (insensible a la casse, mots entiers). Valeur = reecriture prononcable, ou phonemes IPA entre barres obliques (/.../) transmis tels quels a Kokoro.",
+  "JinHyeok": "Jin-hyuk",
+  "Jinhyeok": "Jin-hyuk",
+  "Kang JinHyeok": "Kang Jin-hyuk",
+  "Destia": "Dess-tee-ah",
+  "Etherion": "Eh-theer-ee-on",
+  "Headon": "Head-on",
+  "Bam": "Bahm",
+  "Khun": "Koon",
+  "Yuri Zahard": "Yuri Za-hard",
+  "Talse Uzer": "Tal-see User",
+  "Slave. In. Utero": "Slave In Utero",
+  "SSS-rank": "triple-S rank",
+  "SS-rank": "double-S rank"
+}

@@ -1,0 +1,18 @@
+﻿output/
+!output/.gitkeep
+# Bruitages de substitution synthetises et musiques deposees par l'utilisateur
+config/sfx/*.wav
+config/bgm/*
+!config/sfx/README.md
+!config/bgm/README.md
+.venv/
+__pycache__/
+*.pyc
+.env
+
+.gemini_key
+*.key
+# Suivi d'execution des lots (etat local)
+batch_status.json
+batch_status.json.tmp
+
