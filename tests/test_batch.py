@@ -232,13 +232,23 @@ def test_quota_exhaustion_short_circuits_remaining_chapters(tmp_path) -> None:
     tracker = Tracker()
     urls = [url_for(1), url_for(2), url_for(3)]
     batch = BatchOptions(max_chapters=1, status_file=tmp_path / "status.json", out_root=tmp_path / "out")
-    report = asyncio.run(process_batch(urls, PipelineOptions(), batch, manager=make_manager(), stages=fake_stages(tracker, quota_on={url_for(1)})))
+    gemini = PipelineOptions(script_ai="gemini")
+    report = asyncio.run(process_batch(urls, gemini, batch, manager=make_manager(), stages=fake_stages(tracker, quota_on={url_for(1)})))
     assert len(report.errors) == 3 and not report.results
     assert all("QuotaExhausted" in e for e in report.errors.values())
     # Apres le premier epuisement, les chapitres suivants n'appellent plus Gemini (scrape seul).
     assert [u for s, u in tracker.calls if s == "analyze"] == [url_for(1)]
     with pytest.raises(BatchError):
-        asyncio.run(process_batch([], PipelineOptions(), batch, manager=make_manager(), stages=fake_stages(tracker)))
+        asyncio.run(process_batch([], gemini, batch, manager=make_manager(), stages=fake_stages(tracker)))
+
+
+def test_gemini_quota_does_not_stop_a_claude_batch(tmp_path) -> None:
+    """Claude ecrit les scripts : un quota Gemini epuise (repli d'un chapitre) n'arrete pas les autres."""
+    tracker = Tracker()
+    urls = [url_for(1), url_for(2), url_for(3)]
+    batch = BatchOptions(max_chapters=1, status_file=tmp_path / "status.json", out_root=tmp_path / "out")
+    report = asyncio.run(process_batch(urls, PipelineOptions(), batch, manager=make_manager(), stages=fake_stages(tracker, quota_on={url_for(1)})))
+    assert list(report.errors) == [url_for(1)] and len(report.results) == 2
 
 
 def test_redo_reprocesses_done_chapters_from_a_given_stage(tmp_path) -> None:

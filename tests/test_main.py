@@ -82,6 +82,18 @@ def test_no_upscale_flag_keeps_native_figures(monkeypatch: pytest.MonkeyPatch, n
     assert seen["options"].figure_upscale is False
 
 
+def test_script_ai_defaults_to_claude_and_can_switch_to_gemini(monkeypatch: pytest.MonkeyPatch, no_gemini) -> None:
+    seen: list = []
+    monkeypatch.setattr(main_mod, "run_pipeline", lambda url, out_dir, options, manager=None: seen.append(options))
+    monkeypatch.setattr(main_mod, "format_result", lambda result: "ok")
+    url = "https://www.webtoons.com/en/x/y/viewer?title_no=1&episode_no=2"
+    assert runner.invoke(main_mod.app, ["run", url]).exit_code == 0
+    assert runner.invoke(main_mod.app, ["run", url, "--script-ai", "gemini"]).exit_code == 0
+    assert runner.invoke(main_mod.app, ["run", url, "--claude-model", "claude-sonnet-5"]).exit_code == 0
+    assert [(o.script_ai, o.claude_model) for o in seen] == [
+        ("claude", "claude-opus-5-5"), ("gemini", "claude-opus-5-5"), ("claude", "claude-sonnet-5")]
+
+
 def test_run_prints_failed_and_exits_1(monkeypatch: pytest.MonkeyPatch, no_gemini) -> None:
     def boom(url, out_dir, options, manager=None):
         raise RuntimeError("scraping casse")

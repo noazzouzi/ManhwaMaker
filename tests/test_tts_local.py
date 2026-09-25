@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-dir", type=Path, default=None, help="Dossier des WAV (defaut <scenes>/audio).")
     parser.add_argument("--language", type=str, default=None,
                         help=f"Langue de narration (defaut : celle du scenes.json, sinon {DEFAULT_NARRATION_LANGUAGE}).")
-    parser.add_argument("--voice", type=str, default=None, help="Voix Kokoro (defaut : am_puck pour l'anglais).")
+    parser.add_argument("--voice", type=str, default=None, help="Voix Kokoro (defaut : am_fenrir,am_michael pour l'anglais).")
     parser.add_argument("--speed", type=float, default=DEFAULT_SPEED, help=f"Vitesse (defaut {DEFAULT_SPEED}).")
     parser.add_argument("--padding", type=float, default=DEFAULT_PADDING_S,
                         help=f"Silence de fin en secondes (defaut {DEFAULT_PADDING_S}).")

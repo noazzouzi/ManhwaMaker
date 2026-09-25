@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 #: Nom du fichier écrit dans le dossier de chaque chapitre, à côté de ``scenes.json``.
 CHARACTERS_FILE: str = "characters.json"
+#: Sous-dossier d'une compilation où sont archivées les fiches de ses chapitres : les
+#: dossiers de chapitres sont supprimés après la compilation, la mémoire de la série reste.
+ARCHIVE_DIRNAME: str = "series_memory"
 #: Nombre de fiches maximum envoyées au modèle. Au-delà, le prompt se dilue et les
 #: figurants d'un seul chapitre noient les personnages principaux.
 MAX_SHEET_CARDS: int = 20
@@ -138,7 +141,8 @@ def _read_sheet(path: Path) -> dict | None:
     if not isinstance(data, dict) or not isinstance(data.get("characters"), list):
         logger.warning("Fiche de serie mal formee, ignoree : %s", path)
         return None
-    if not isinstance(data.get("episode_no"), int):
+    episode_no = data.get("episode_no")
+    if isinstance(episode_no, bool) or not isinstance(episode_no, (int, float)):
         return None
     return data
 
@@ -205,7 +209,7 @@ def _rank_cards(cards: Sequence[CharacterCard], sheets: Sequence[dict]) -> list[
 
 
 def load_series_context(
-    series_root: str | Path, *, key: str, before_episode: int | None
+    series_root: str | Path, *, key: str, before_episode: int | float | None
 ) -> tuple[list[CharacterCard], str]:
     """``(fiches, fin du chapitre précédent)`` des épisodes **antérieurs** de cette série.
 
@@ -226,12 +230,17 @@ def load_series_context(
         return [], ""
 
     sheets: list[dict] = []
-    for path in sorted(root.glob(f"*/{CHARACTERS_FILE}")):
+    seen: set = set()
+    # Dossiers de chapitres d'abord, puis fiches archivées par les compilations (chapitres
+    # supprimés) : un même épisode n'est compté qu'une fois, la fiche vivante l'emporte.
+    paths = [*sorted(root.glob(f"*/{CHARACTERS_FILE}")), *sorted(root.glob(f"*/{ARCHIVE_DIRNAME}/*.json"))]
+    for path in paths:
         data = _read_sheet(path)
         if data is None or data.get("series") != key:
             continue
-        if data["episode_no"] >= before_episode:
+        if data["episode_no"] >= before_episode or data["episode_no"] in seen:
             continue
+        seen.add(data["episode_no"])
         sheets.append(data)
     if not sheets:
         return [], ""
@@ -248,7 +257,29 @@ def load_series_context(
     return cards, tail
 
 
+def archive_sheets(chapter_dirs: Iterable[str | Path], target_dir: str | Path) -> int:
+    """Copie les fiches des chapitres dans ``<target_dir>/series_memory/`` ; renvoie leur nombre.
+
+    Appelé par une compilation avant de supprimer ses dossiers de chapitres :
+    :func:`load_series_context` relit ces archives, le chapitre suivant garde donc les noms.
+    """
+    archive = Path(target_dir) / ARCHIVE_DIRNAME
+    count = 0
+    for folder in chapter_dirs:
+        sheet = Path(folder) / CHARACTERS_FILE
+        if not sheet.is_file():
+            continue
+        archive.mkdir(parents=True, exist_ok=True)
+        (archive / f"{Path(folder).name}.json").write_bytes(sheet.read_bytes())
+        count += 1
+    if count:
+        logger.info("Memoire de serie archivee : %d fiche(s) dans %s", count, archive)
+    return count
+
+
 __all__ = [
+    "ARCHIVE_DIRNAME",
+    "archive_sheets",
     "CHARACTERS_FILE",
     "MAX_ALIASES",
     "MAX_SHEET_CARDS",

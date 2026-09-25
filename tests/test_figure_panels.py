@@ -127,6 +127,45 @@ def test_remap_without_figures_leaves_scenes_empty() -> None:
     assert all(s.panel_ids == [] for s in out.scenes)
 
 
+# --- Personnages retenus pour le montage ------------------------------------------------------------
+FRAME = (1920, 1080)
+
+
+def figure(index: int, w: int, h: int, reading: list[int], score: float = 0.9) -> dict:
+    return {"index": index, "x0": 0, "y0": 100 * index, "x1": w, "y1": 100 * index + h, "w": w, "h": h,
+            "score": score, "reading_panels": reading}
+
+
+def test_big_enough_measures_the_upscale_needed_to_fill_the_frame() -> None:
+    assert not fp.big_enough(figure(0, 78, 114, [0]), FRAME)  # villageoises au loin : x8,5
+    assert not fp.big_enough(figure(0, 111, 262, [0]), FRAME)  # x3,7
+    assert fp.big_enough(figure(0, 494, 328, [0]), FRAME)  # x2,96
+    assert fp.big_enough(figure(0, 665, 272, [0]), FRAME)  # large : la largeur limite à x2,6
+    assert not fp.big_enough(figure(0, 300, 300, [0]), (1080, 1920))  # format vertical : x3,24
+    assert fp.big_enough(figure(0, 111, 262, [0]), FRAME, max_factor=4.0)
+
+
+def test_select_figures_drops_small_ones_and_unsure_extras() -> None:
+    figures = [
+        figure(0, 400, 600, [0], score=0.3),  # clé, peu sûre : gardée (choisie par le script)
+        figure(1, 80, 110, [0]),  # clé mais minuscule : jamais montée
+        figure(2, 500, 500, [1]),
+        figure(3, 500, 500, [3], score=0.35),  # hors cases clés et peu sûre : écartée
+        figure(4, 500, 500, [3]),  # hors cases clés, sûre : proposée au montage
+        figure(5, 100, 250, [2]),  # seule personne de la scène 3, trop petite
+    ]
+    display, ids = fp.select_figures(analysis(), figures, FRAME)
+    assert ids == [0, 2, 4]
+    # Scène 3 : son personnage est trop petit, elle reçoit le personnage montable le plus proche.
+    assert [s.panel_ids for s in display.scenes] == [[0], [2, 0], [2]]
+    assert display.scenes[0].action_heavy_ids == [0] and display.n_panels == 4
+
+
+def test_select_figures_without_big_enough_figure() -> None:
+    display, ids = fp.select_figures(analysis(), [figure(0, 80, 110, [0])], FRAME)
+    assert ids == [] and display == analysis()
+
+
 # --- Montage ---------------------------------------------------------------------------------------
 def test_montage_uses_figure_panels_and_translated_analysis(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     fig_dir = tmp_path / fp.FIGURES_DIRNAME
@@ -146,6 +185,26 @@ def test_montage_uses_figure_panels_and_translated_analysis(tmp_path, monkeypatc
         pipeline_mod.stage_montage(analysis(), None, None, tmp_path, options, result)
     assert seen["panels_dir"] == fig_dir and seen["meta"] == [{"index": 0}]
     assert [s.panel_ids for s in seen["analysis"].scenes][0] == [0, 1] and result.n_figures == 3
+
+
+def test_montage_offers_only_selected_figures(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fig_dir = tmp_path / fp.FIGURES_DIRNAME
+    fig_dir.mkdir()
+    (fig_dir / "panels.json").write_text(json.dumps([{"index": i} for i in range(4)]), encoding="utf-8")
+    figures = [figure(0, 400, 600, [0]), figure(1, 80, 110, [1]), figure(2, 500, 500, [1]), figure(3, 500, 500, [3], score=0.3)]
+    monkeypatch.setattr(pipeline_mod, "ensure_figures", lambda out_dir, options, force=False: figures)
+    options = PipelineOptions(figure_upscale=False)
+    panels_dir, display, meta = pipeline_mod._montage_panels(analysis(), tmp_path, options, PipelineResult(out_dir=tmp_path))
+    assert panels_dir == fig_dir and meta == [{"index": 0}, {"index": 2}]  # ni la minuscule ni la douteuse
+    assert [s.panel_ids for s in display.scenes] == [[0], [2, 0], [2]]
+
+
+def test_montage_falls_back_to_whole_panels_when_every_figure_is_tiny(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "panels.json").write_text(json.dumps([{"index": 0}]), encoding="utf-8")
+    monkeypatch.setattr(pipeline_mod, "ensure_figures", lambda out_dir, options, force=False: [figure(0, 80, 110, [0])])
+    result = PipelineResult(out_dir=tmp_path)
+    panels_dir, display, meta = pipeline_mod._montage_panels(analysis(), tmp_path, PipelineOptions(), result)
+    assert panels_dir == tmp_path and display == analysis() and meta == [{"index": 0}] and result.n_figures == 0
 
 
 def test_montage_falls_back_to_whole_panels_without_characters(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

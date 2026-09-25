@@ -51,7 +51,7 @@ def test_factory_builds_both_formats_and_freezes_them() -> None:
     assert long_p.subtitles.max_words == 4 and long_p.subtitles.stroke_px == 2
     # Seule derogation aux reglages historiques : la voix est acceleree de 15 %, a la
     # demande. Kokoro parle plus vite a la synthese, la hauteur de voix ne monte pas.
-    assert long_p.audio.speed == LONG_SPEED == 1.15 and not long_p.outro.enabled
+    assert long_p.audio.speed == LONG_SPEED == 1.4 and not long_p.outro.enabled
     # Le format court applique la specification.
     assert (short_p.framing.width, short_p.framing.height) == (1080, 1920)
     assert short_p.framing.fit == "cover_crop" and short_p.framing.saliency_crop

@@ -1,4 +1,4 @@
-"""Schémas Pydantic décrivant un chapitre Webtoons scrapé.
+"""Schémas Pydantic décrivant un chapitre scrapé (Webtoons ou Asura Scans).
 
 Ce module ne contient que des structures de données : aucune requête réseau,
 aucun traitement d'image. Il est partagé par le scraper (qui le remplit) et
@@ -20,8 +20,10 @@ class ChapterMeta(BaseModel):
         episode_title: Titre de l'épisode (ex. ``"[Season 1] Ep. 0"``).
         title_no: Identifiant numérique de la série (paramètre ``title_no``
             de l'URL), ``None`` s'il est absent.
-        episode_no: Numéro de l'épisode (paramètre ``episode_no`` de l'URL,
-            sinon libellé ``span.tx`` de la page), ``None`` s'il est absent.
+        episode_no: Numéro de l'épisode (paramètre ``episode_no`` de l'URL
+            Webtoons, sinon libellé ``span.tx`` de la page ; numéro de chapitre
+            Asura, décimal pour les chapitres bonus comme ``74.5``), ``None``
+            s'il est absent.
         image_urls: URLs des morceaux d'image, dans l'ordre de lecture.
         chunk_sizes: Dimensions ``(largeur, hauteur)`` de chaque morceau
             téléchargé, dans le même ordre que ``image_urls``. Vide tant que
@@ -37,7 +39,7 @@ class ChapterMeta(BaseModel):
     series_title: str
     episode_title: str
     title_no: int | None
-    episode_no: int | None
+    episode_no: int | float | None
     image_urls: list[str]
     chunk_sizes: list[tuple[int, int]] = Field(default_factory=list)
 

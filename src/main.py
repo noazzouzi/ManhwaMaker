@@ -2,9 +2,10 @@
 
 Usage (depuis la racine du projet) :
 
-    python -m src.main run "<url du viewer Webtoons>"                  # toutes les etapes, un chapitre
+    python -m src.main run "<url du viewer Webtoons ou du chapitre Asura>"  # toutes les etapes, un chapitre
     python -m src.main run "<url>" --out output/mon-chapitre --voice af_heart --preview-seconds 30
     python -m src.main batch "<url de la serie ou d'un episode>" --start-chapter 1 --end-chapter 20
+    python -m src.main batch "<url de la serie>" --start-chapter 1 --end-chapter 20 --compile   # une seule video
     python -m src.main batch --url-list chapitres.txt --max-chapters 5 --max-gemini-rpm 10 --max-tts-workers 2
     python -m src.main preview output/<chapitre> --seconds 60          # re-rendre l'apercu seul
     python -m src.main capcut output/<chapitre> --capcut-dir ...       # regenerer le brouillon seul
@@ -22,10 +23,17 @@ from typing import Annotated, Optional
 
 import typer
 
-from src.pipeline import DEFAULT_PREVIEW_SECONDS, PipelineOptions, format_result, run_pipeline, slug_from_url
+from src.pipeline import (
+    DEFAULT_COMPILATION_PREVIEW_S,
+    DEFAULT_PREVIEW_SECONDS,
+    PipelineOptions,
+    format_result,
+    run_pipeline,
+    slug_from_url,
+)
 from src.utils.config import DEFAULT_NARRATION_LANGUAGE, PROJECT_ROOT
 
-app = typer.Typer(add_completion=False, help="Auto-Manhwa Recap Generator : URL Webtoons -> projet CapCut + apercu.")
+app = typer.Typer(add_completion=False, help="Auto-Manhwa Recap Generator : URL Webtoons ou Asura Scans -> projet CapCut + apercu.")
 
 
 def _setup(verbose: bool) -> None:
@@ -53,10 +61,13 @@ def _pipeline_options(
     sentence_gap=None, padding=None, batch_size=None, gemini_batch_delay=None, keyframe_workers=None,
     multi_call=False, dynamics=None, transition_compensation=None, thumbnail=False, thumbnail_backend=None,
     video_format=None, no_series_memory=False, panels="figures", figure_margin=0.0, figure_bubbles="cut",
-    figures_separate=False, no_upscale=False,
+    figures_separate=False, no_upscale=False, script_ai="claude", claude_model=None,
 ) -> PipelineOptions:
     overrides = {"panels": panels, "figure_margin": figure_margin, "figure_bubbles": figure_bubbles,
-                 "figure_group": not figures_separate, "figure_upscale": not no_upscale}
+                 "figure_group": not figures_separate, "figure_upscale": not no_upscale,
+                 "script_ai": str(script_ai).lower()}
+    if claude_model:
+        overrides["claude_model"] = claude_model
     if video_format is not None:
         overrides["video_format"] = str(video_format).upper()
     if dynamics is not None:
@@ -93,14 +104,16 @@ def _pipeline_options(
 
 @app.command()
 def run(
-    url: Annotated[str, typer.Argument(help="URL du viewer Webtoons (.../viewer?title_no=..&episode_no=..).")],
+    url: Annotated[str, typer.Argument(help="URL du viewer Webtoons (.../viewer?title_no=..&episode_no=..) ou d'un chapitre Asura Scans (.../comics/<serie>/chapter/<n>).")],
     out: Annotated[Optional[Path], typer.Option("--out", "-o", help="Dossier de sortie (defaut output/<serie>_epN).")] = None,
     language: Annotated[str, typer.Option("--language", help="Langue de la narration et de la voix.")] = DEFAULT_NARRATION_LANGUAGE,
-    voice: Annotated[Optional[str], typer.Option("--voice", help="Voix Kokoro (defaut am_puck en anglais ; voir la commande voices).")] = None,
+    voice: Annotated[Optional[str], typer.Option("--voice", help="Voix Kokoro (defaut am_fenrir,am_michael en anglais, melange des deux ; voir la commande voices).")] = None,
     speed: Annotated[float, typer.Option("--speed", help="Vitesse de la voix.")] = 1.0,
-    sentence_gap: Annotated[Optional[float], typer.Option("--sentence-gap", help="Silence entre deux phrases (defaut 0,2 s).")] = None,
-    padding: Annotated[Optional[float], typer.Option("--padding", help="Silence en fin de scene (defaut 0,18 s).")] = None,
-    model: Annotated[Optional[str], typer.Option("--model", help="Modele Gemini prefere (la cascade de secours suit).")] = None,
+    sentence_gap: Annotated[Optional[float], typer.Option("--sentence-gap", help="Silence ajoute entre deux phrases (defaut 0 : pauses laissees a Kokoro).")] = None,
+    padding: Annotated[Optional[float], typer.Option("--padding", help="Silence ajoute en fin de scene (defaut 0 : silence naturel de Kokoro).")] = None,
+    script_ai: Annotated[str, typer.Option("--script-ai", help="IA qui ecrit le script : claude (defaut, CLI local et abonnement ; Gemini en repli si Claude echoue) ou gemini.")] = "claude",
+    claude_model: Annotated[Optional[str], typer.Option("--claude-model", help="Modele Claude du script (defaut claude-opus-5-5).")] = None,
+    model: Annotated[Optional[str], typer.Option("--model", help="Modele Gemini prefere, pour --script-ai gemini ou le repli (la cascade de secours suit).")] = None,
     thinking_budget: Annotated[Optional[int], typer.Option("--thinking-budget", help="Budget de reflexion Gemini.")] = None,
     batch_size: Annotated[Optional[int], typer.Option("--batch-size", help="Images par lot Gemini (10-15, defaut 12) ; 15 = ~20 %% d'appels en moins.")] = None,
     gemini_batch_delay: Annotated[Optional[float], typer.Option("--gemini-batch-delay", help="Pause forcee entre deux envois (defaut 2,5 s ; 0 est sur avec --max-gemini-rpm).")] = None,
@@ -141,6 +154,7 @@ def run(
     out_dir = out or (PROJECT_ROOT / "output" / slug_from_url(url))
     options = _pipeline_options(
         language=language, voice=voice, speed=speed, model=model, thinking_budget=thinking_budget,
+        script_ai=script_ai, claude_model=claude_model,
         preview_seconds=preview_seconds, no_preview=no_preview, no_capcut=no_capcut, capcut_dir=capcut_dir,
         project_name=project_name, bgm=bgm, bgm_dir=bgm_dir, no_bgm=no_bgm, sfx_dir=sfx_dir, no_sfx=no_sfx,
         cta=cta, no_cta=no_cta, fps=fps, force=force, sentence_gap=sentence_gap, padding=padding, batch_size=batch_size,
@@ -165,7 +179,7 @@ def run(
 
 @app.command()
 def batch(
-    url: Annotated[Optional[str], typer.Argument(help="URL de la serie (liste) ou de n'importe quel episode.")] = None,
+    url: Annotated[Optional[str], typer.Argument(help="URL de la serie (liste Webtoons, page de serie Asura) ou de n'importe quel episode.")] = None,
     url_list: Annotated[Optional[Path], typer.Option("--url-list", help="Fichier texte : une URL de chapitre par ligne.")] = None,
     start_chapter: Annotated[Optional[int], typer.Option("--start-chapter", help="Premier episode_no de la plage.")] = None,
     end_chapter: Annotated[Optional[int], typer.Option("--end-chapter", help="Dernier episode_no de la plage.")] = None,
@@ -180,11 +194,13 @@ def batch(
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Lister les chapitres cibles sans rien traiter.")] = False,
     no_series_order: Annotated[bool, typer.Option("--no-series-order", help="Analyser les episodes d'une serie en parallele plutot que dans l'ordre (plus rapide, mais le chapitre N n'herite plus des noms du N-1).")] = False,
     language: Annotated[str, typer.Option("--language", help="Langue de la narration et de la voix.")] = DEFAULT_NARRATION_LANGUAGE,
-    voice: Annotated[Optional[str], typer.Option("--voice", help="Voix Kokoro (defaut am_puck en anglais ; voir la commande voices).")] = None,
+    voice: Annotated[Optional[str], typer.Option("--voice", help="Voix Kokoro (defaut am_fenrir,am_michael en anglais, melange des deux ; voir la commande voices).")] = None,
     speed: Annotated[float, typer.Option("--speed", help="Vitesse de la voix.")] = 1.0,
-    sentence_gap: Annotated[Optional[float], typer.Option("--sentence-gap", help="Silence entre deux phrases (defaut 0,2 s).")] = None,
-    padding: Annotated[Optional[float], typer.Option("--padding", help="Silence en fin de scene (defaut 0,18 s).")] = None,
-    model: Annotated[Optional[str], typer.Option("--model", help="Modele Gemini prefere (la cascade de secours suit).")] = None,
+    sentence_gap: Annotated[Optional[float], typer.Option("--sentence-gap", help="Silence ajoute entre deux phrases (defaut 0 : pauses laissees a Kokoro).")] = None,
+    padding: Annotated[Optional[float], typer.Option("--padding", help="Silence ajoute en fin de scene (defaut 0 : silence naturel de Kokoro).")] = None,
+    script_ai: Annotated[str, typer.Option("--script-ai", help="IA qui ecrit le script : claude (defaut, CLI local et abonnement ; Gemini en repli si Claude echoue) ou gemini.")] = "claude",
+    claude_model: Annotated[Optional[str], typer.Option("--claude-model", help="Modele Claude du script (defaut claude-opus-5-5).")] = None,
+    model: Annotated[Optional[str], typer.Option("--model", help="Modele Gemini prefere, pour --script-ai gemini ou le repli (la cascade de secours suit).")] = None,
     thinking_budget: Annotated[Optional[int], typer.Option("--thinking-budget", help="Budget de reflexion Gemini.")] = None,
     batch_size: Annotated[Optional[int], typer.Option("--batch-size", help="Images par lot Gemini (10-15, defaut 12) ; 15 = ~20 %% d'appels en moins.")] = None,
     gemini_batch_delay: Annotated[Optional[float], typer.Option("--gemini-batch-delay", help="Pause forcee entre deux envois (defaut 2,5 s ; 0 est sur avec --max-gemini-rpm).")] = None,
@@ -208,6 +224,8 @@ def batch(
     no_cta: Annotated[bool, typer.Option("--no-cta", help="Aucun appel a l'abonnement.")] = False,
     fps: Annotated[int, typer.Option("--fps", help="Images par seconde.")] = 60,
     redo: Annotated[Optional[str], typer.Option("--redo", help="Recalculer a partir de cette etape : analyze, tts ou montage (les precedentes sont reutilisees, donc aucun quota Gemini pour --redo tts).")] = None,
+    compile_video: Annotated[bool, typer.Option("--compile", help="Une seule video pour tous les chapitres : compilation (projet CapCut + extrait de 2 min), puis suppression des dossiers de chapitres.")] = False,
+    keep_chapters: Annotated[bool, typer.Option("--keep-chapters", help="Avec --compile : garder les dossiers de chapitres.")] = False,
     force: Annotated[bool, typer.Option("--force", help="Recalculer toutes les etapes, chapitres deja faits compris.")] = False,
     no_series_memory: Annotated[bool, typer.Option("--no-series-memory", help="Ne pas reutiliser la fiche des personnages des episodes precedents.")] = False,
     panels: Annotated[str, typer.Option("--panels", help="Cases montees : figures (defaut, personnages detectes seuls) ou slicer (cases entieres).")] = "figures",
@@ -237,10 +255,13 @@ def batch(
         print(_ascii(f"  - {chapter_url}"))
     if dry_run:
         return
+    # Compilation : ni apercu ni brouillon CapCut par chapitre (les dossiers vont disparaitre,
+    # un brouillon par chapitre pointerait sur des fichiers supprimes) ; seule la compilation en a.
     options = _pipeline_options(
         language=language, voice=voice, speed=speed, model=model, thinking_budget=thinking_budget,
-        preview_seconds=preview_seconds, no_preview=no_preview, no_capcut=no_capcut, capcut_dir=capcut_dir,
-        project_name=None, bgm=bgm, bgm_dir=bgm_dir, no_bgm=no_bgm, sfx_dir=sfx_dir, no_sfx=no_sfx,
+        script_ai=script_ai, claude_model=claude_model,
+        preview_seconds=preview_seconds, no_preview=no_preview or compile_video, no_capcut=no_capcut or compile_video,
+        capcut_dir=capcut_dir, project_name=None, bgm=bgm, bgm_dir=bgm_dir, no_bgm=no_bgm, sfx_dir=sfx_dir, no_sfx=no_sfx,
         cta=cta, no_cta=no_cta, fps=fps, force=force, redo=redo,
         sentence_gap=sentence_gap, padding=padding, batch_size=batch_size,
         gemini_batch_delay=gemini_batch_delay, keyframe_workers=keyframe_workers, multi_call=multi_call,
@@ -264,24 +285,25 @@ def batch(
     print(format_report(report))
     if report.errors and not report.results:
         raise typer.Exit(code=1)
+    if compile_video:
+        if report.errors:
+            print(_ascii(f"Compilation non faite : {len(report.errors)} chapitre(s) en echec (relancer la meme commande)."))
+            raise typer.Exit(code=1)
+        # Tous les chapitres demandes, y compris ceux deja faits lors d'un lot precedent.
+        folders = [batch_options.out_root / slug_from_url(u) for u in urls]
+        missing = [f.name for f in folders if not (f / "timeline.json").is_file()]
+        if missing:
+            print(_ascii(f"Compilation non faite : chapitre(s) sans montage {missing} (deja compiles et supprimes ? --force pour les refaire)."))
+            raise typer.Exit(code=1)
+        _compile(folders, out=None, name=None, gap=0.6, preview_seconds=DEFAULT_COMPILATION_PREVIEW_S,
+                 make_capcut=not no_capcut, capcut_dir=capcut_dir, delete_chapters=not keep_chapters,
+                 root=batch_options.out_root)
 
 
-@app.command()
-def merge(
-    folders: Annotated[Optional[list[Path]], typer.Argument(help="Dossiers de chapitres deja traites (contenant timeline.json).")] = None,
-    pattern: Annotated[Optional[str], typer.Option("--pattern", help="Motif glob depuis la racine, ex. \"output/ma-serie_ep*\".")] = None,
-    out: Annotated[Optional[Path], typer.Option("--out", "-o", help="Dossier de la compilation (defaut output/<serie>_compilation).")] = None,
-    name: Annotated[Optional[str], typer.Option("--name", help="Nom du projet CapCut.")] = None,
-    gap: Annotated[float, typer.Option("--gap", help="Silence entre deux chapitres (secondes).")] = 0.6,
-    preview_seconds: Annotated[float, typer.Option("--preview-seconds", help="Duree de l'apercu (0 = complet, -1 = aucun).")] = -1.0,
-    no_capcut: Annotated[bool, typer.Option("--no-capcut", help="Ne pas generer le brouillon CapCut.")] = False,
-    capcut_dir: Annotated[Optional[Path], typer.Option("--capcut-dir", help="Dossier des projets CapCut.")] = None,
-    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
-) -> None:
-    """Fusionne plusieurs chapitres deja traites en UN SEUL projet CapCut (compilation)."""
-    from src.pipeline import build_compilation, chapter_folders
+def _compile(folders, *, out, name, gap, preview_seconds, make_capcut, capcut_dir, delete_chapters, pattern=None, root=None) -> None:
+    """Compilation commune a ``merge`` et ``batch --compile`` (affiche le resultat, sort en code 1 sur erreur)."""
+    from src.pipeline import build_compilation, chapter_folders, compilation_dirname
 
-    _setup(verbose)
     try:
         chapters = chapter_folders(folders or [], pattern)
     except ValueError as exc:
@@ -290,18 +312,43 @@ def merge(
     print(_ascii(f"{len(chapters)} chapitre(s) a fusionner :"))
     for folder in chapters:
         print(_ascii(f"  - {folder}"))
-    target = out or (PROJECT_ROOT / "output" / f"{chapters[0].name.rsplit('_ep', 1)[0]}_compilation")
+    target = out or (Path(root or PROJECT_ROOT / "output") / compilation_dirname(chapters))
     try:
         result = build_compilation(
-            chapters, target, name=name, gap_s=gap,
-            preview_seconds=None if preview_seconds < 0 else preview_seconds,
-            make_capcut=not no_capcut, capcut_dir=str(capcut_dir) if capcut_dir else None,
+            chapters, target, name=name, gap_s=gap, preview_seconds=preview_seconds,
+            make_capcut=make_capcut, capcut_dir=str(capcut_dir) if capcut_dir else None,
+            delete_chapters=delete_chapters,
         )
     except Exception as exc:  # noqa: BLE001 - la CLI doit afficher toute erreur
         logging.getLogger(__name__).exception("Compilation en echec")
         print(_ascii(f"FAILED: {type(exc).__name__}: {exc}"))
         raise typer.Exit(code=1)
     print(format_result(result))
+    if delete_chapters:
+        print(_ascii(f"Dossiers de chapitres supprimes ({len(chapters)}) : la compilation est autonome."))
+
+
+@app.command()
+def merge(
+    folders: Annotated[Optional[list[Path]], typer.Argument(help="Dossiers de chapitres deja traites (contenant timeline.json).")] = None,
+    pattern: Annotated[Optional[str], typer.Option("--pattern", help="Motif glob depuis la racine, ex. \"output/ma-serie_ep*\".")] = None,
+    out: Annotated[Optional[Path], typer.Option("--out", "-o", help="Dossier de la compilation (defaut output/<serie>_compilation_ch<premier>-<dernier>).")] = None,
+    name: Annotated[Optional[str], typer.Option("--name", help="Nom du projet CapCut.")] = None,
+    gap: Annotated[float, typer.Option("--gap", help="Silence entre deux chapitres (secondes).")] = 0.6,
+    preview_seconds: Annotated[float, typer.Option("--preview-seconds", help="Duree de l'extrait MP4 (defaut 120 ; 0 = video complete, -1 = aucun). La video complete se rend dans CapCut.")] = DEFAULT_COMPILATION_PREVIEW_S,
+    keep_chapters: Annotated[bool, typer.Option("--keep-chapters", help="Garder les dossiers de chapitres (supprimes par defaut, la compilation etant autonome).")] = False,
+    no_capcut: Annotated[bool, typer.Option("--no-capcut", help="Ne pas generer le brouillon CapCut.")] = False,
+    capcut_dir: Annotated[Optional[Path], typer.Option("--capcut-dir", help="Dossier des projets CapCut.")] = None,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+) -> None:
+    """Fusionne plusieurs chapitres deja traites en UN SEUL projet CapCut (compilation autonome).
+
+    Les dossiers de chapitres sont ensuite supprimes (--keep-chapters pour les garder).
+    """
+    _setup(verbose)
+    _compile(folders, pattern=pattern, out=out, name=name, gap=gap,
+             preview_seconds=None if preview_seconds < 0 else preview_seconds, make_capcut=not no_capcut,
+             capcut_dir=capcut_dir, delete_chapters=not keep_chapters)
 
 
 @app.command()

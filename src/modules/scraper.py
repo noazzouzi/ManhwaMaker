@@ -1,4 +1,8 @@
-"""Module 1 — Scraper & Stitcher Webtoons.
+"""Module 1 — Scraper & Stitcher (Webtoons, Asura Scans).
+
+Deux sites : Webtoons (``webtoons.com``, décrit ci-dessous) et Asura Scans
+(``asurascans.com``, parsing dans :mod:`src.modules.asura`). Le site est reconnu à
+l'URL ; téléchargement, assemblage et découpe sont communs.
 
 Pipeline :
 
@@ -13,7 +17,8 @@ Pipeline :
    enregistre la bande sur disque (optionnel).
 
 Garde-fou : chaque requête (page + images) porte ``User-Agent`` et
-``Referer: https://www.webtoons.com/`` — sans eux Webtoons répond 403.
+``Referer: https://www.webtoons.com/`` — sans eux Webtoons répond 403. Les requêtes
+Asura portent le ``Referer`` d'Asura (:data:`src.modules.asura.REFERER`).
 
 CLI : ``python -m src.modules.scraper <url> [--out output/strip.png]``.
 """
@@ -38,6 +43,7 @@ from bs4 import BeautifulSoup, Tag
 from PIL import Image, UnidentifiedImageError
 
 from src.models.chapter import ChapterMeta
+from src.modules import asura
 from src.utils.config import DEFAULT_SITE_LANGUAGE
 from src.utils.http import ensure_mandatory_headers, get_with_retry
 
@@ -55,6 +61,8 @@ __all__ = [
     "series_list_url",
     "parse_episode_links",
     "discover_episodes",
+    "chapter_ids",
+    "is_series_url",
     "parse_chapter_html",
     "fetch_chapter_image_urls",
     "download_images",
@@ -149,13 +157,17 @@ def parse_ids_from_url(url: str) -> tuple[int | None, int | None]:
     return _query_int(query, "title_no"), _query_int(query, "episode_no")
 
 
-def episode_url(url: str, episode_no: int) -> str:
+def episode_url(url: str, episode_no: int | float) -> str:
     """URL du viewer d'un autre épisode de la même série (``episode_no`` remplacé).
+
+    URL Asura : URL du chapitre ``episode_no`` (:func:`src.modules.asura.chapter_url`).
 
     Webtoons ignore le slug d'épisode du chemin et redirige vers l'URL canonique à
     partir de ``title_no`` / ``episode_no`` : une URL de liste (``.../list?title_no=N``)
     ou de viewer convient.
     """
+    if asura.is_asura_url(url):
+        return asura.chapter_url(url, episode_no)
     if episode_no < 1:
         raise ValueError("episode_no doit etre >= 1")
     parsed = urlparse(url)
@@ -201,8 +213,10 @@ def discover_episodes(
     *,
     language: str | None = DEFAULT_SITE_LANGUAGE,
     max_pages: int = 60,
-) -> dict[int, str]:
+) -> dict[int | float, str]:
     """Liste tous les épisodes d'une série (``{episode_no: URL}``) en parcourant les pages de liste.
+
+    Asura liste tous ses chapitres sur la page de la série (numéros décimaux compris).
 
     Args:
         url: URL de la série (liste) ou de n'importe quel épisode.
@@ -210,8 +224,15 @@ def discover_episodes(
         language: langue du site imposée à l'URL.
         max_pages: garde-fou sur la pagination (``&page=N``).
     """
+    if asura.is_asura_url(url):
+        page_url = asura.series_url(url)
+        with _session_scope(session) as http:
+            response = get_with_retry(http, page_url, **_site_kwargs(page_url))
+        chapters = asura.parse_chapter_links(response.text, page_url)
+        logger.info("%d chapitre(s) trouve(s) pour %s", len(chapters), page_url)
+        return dict(sorted(chapters.items()))
     list_url = series_list_url(normalize_webtoon_url(url, language))
-    episodes: dict[int, str] = {}
+    episodes: dict[int | float, str] = {}
     with _session_scope(session) as http:
         for page in range(1, max_pages + 1):
             page_url = f"{list_url}&page={page}" if page > 1 else list_url
@@ -223,6 +244,32 @@ def discover_episodes(
             episodes.update(new)
     logger.info("%d episode(s) trouve(s) pour %s", len(episodes), list_url)
     return dict(sorted(episodes.items()))
+
+
+def chapter_ids(url: str) -> tuple[str | None, int | float | None]:
+    """``(clé de série, numéro de chapitre)`` d'une URL, quel que soit le site.
+
+    La clé est stable d'un chapitre à l'autre (``t<title_no>`` sur Webtoons,
+    ``asura:<slug>`` sur Asura) ; ``None`` quand l'URL ne la donne pas.
+    """
+    if asura.is_asura_url(url):
+        series, number = asura.parse_url(url)
+        return (f"asura:{series}" if series else None), number
+    title_no, episode_no = parse_ids_from_url(url)
+    return (f"t{title_no}" if title_no is not None else None), episode_no
+
+
+def is_series_url(url: str) -> bool:
+    """Vrai pour une page de série (liste des épisodes) plutôt qu'un chapitre."""
+    if asura.is_asura_url(url):
+        return asura.is_series_url(url)
+    segments = [s for s in urlparse(url).path.split("/") if s]
+    return bool(segments) and segments[-1] == "list"
+
+
+def _site_kwargs(url: str) -> dict:
+    """Arguments de requête propres au site (``Referer`` d'Asura ; rien pour Webtoons)."""
+    return {"headers": {"Referer": asura.REFERER}} if asura.is_asura_url(url) else {}
 
 
 def _text_of(soup: BeautifulSoup, selector: str) -> str:
@@ -399,10 +446,11 @@ def fetch_chapter_image_urls(
     """Télécharge la page du chapitre et en extrait les URLs d'images + titres.
 
     Args:
-        url: URL du viewer Webtoons (``.../viewer?title_no=..&episode_no=..``).
+        url: URL du viewer Webtoons (``.../viewer?title_no=..&episode_no=..``) ou
+            d'un chapitre Asura (``.../comics/<serie>/chapter/<n>``).
         session: Session HTTP ; créée (puis fermée) avec les en-têtes
             obligatoires si ``None``.
-        language: langue du site imposée à l'URL (voir
+        language: langue du site imposée à l'URL Webtoons (voir
             :func:`normalize_webtoon_url`) ; ``None`` pour garder l'URL telle quelle.
 
     Returns:
@@ -413,20 +461,24 @@ def fetch_chapter_image_urls(
         requests.HTTPError: Si la page ne peut pas être téléchargée (statut
             d'erreur définitif, ou erreur réseau persistante après retries).
     """
-    url = normalize_webtoon_url(url, language)
+    on_asura = asura.is_asura_url(url)
+    if not on_asura:
+        url = normalize_webtoon_url(url, language)
     with _session_scope(session) as http:
         logger.info("Telechargement de la page: %s", url)
-        response = get_with_retry(http, url)
+        response = get_with_retry(http, url, **_site_kwargs(url))
         final_url = str(getattr(response, "url", "") or url)
         if final_url != url:
             logger.info("Redirige vers: %s", final_url)
         html = response.text
 
-    meta = parse_chapter_html(html, url=url, final_url=final_url)
+    parse = asura.parse_chapter_html if on_asura else parse_chapter_html
+    meta = parse(html, url=url, final_url=final_url)
     if not meta.image_urls:
+        selectors = (asura.IMAGE_SELECTOR,) if on_asura else IMAGE_SELECTORS
         raise ScraperError(
             f"Aucune image trouvee sur {final_url} "
-            "(selecteurs testes: " + ", ".join(IMAGE_SELECTORS) + ")"
+            "(selecteurs testes: " + ", ".join(selectors) + ")"
         )
     return meta
 
@@ -464,6 +516,7 @@ def download_images(
     *,
     delay: float = 0.15,
     max_retries: int = 3,
+    referer: str | None = None,
 ) -> list[Image.Image]:
     """Télécharge séquentiellement les morceaux d'image, en mémoire, en RGB.
 
@@ -476,6 +529,7 @@ def download_images(
             obligatoires si ``None``.
         delay: Pause (secondes) entre deux requêtes.
         max_retries: Nouvelles tentatives par image (cf. :func:`get_with_retry`).
+        referer: ``Referer`` propre au site (remplace celui de la session).
 
     Returns:
         Liste d'images PIL en mode ``RGB``, une par URL.
@@ -488,12 +542,13 @@ def download_images(
     """
     images: list[Image.Image] = []
     total = len(urls)
+    extra = {"headers": {"Referer": referer}} if referer else {}
     with _session_scope(session) as http:
         for index, url in enumerate(urls):
             if index > 0 and delay > 0:
                 _sleep(delay)
             logger.info("Image %d/%d: %s", index + 1, total, url)
-            response = get_with_retry(http, url, max_retries=max_retries)
+            response = get_with_retry(http, url, max_retries=max_retries, **extra)
             img = _decode_image(response.content, url)
             logger.debug(
                 "Image %d/%d decodee: %dx%d", index + 1, total, img.width, img.height
@@ -572,7 +627,7 @@ def scrape_chapter(
     """Pipeline complet : page → URLs → téléchargement → bande continue.
 
     Args:
-        url: URL du viewer Webtoons.
+        url: URL du viewer Webtoons ou d'un chapitre Asura Scans.
         session: Session HTTP optionnelle (en-têtes obligatoires garantis) ;
             créée puis fermée localement si ``None``.
         delay: Pause (secondes) entre deux téléchargements d'image.
@@ -582,14 +637,32 @@ def scrape_chapter(
     Returns:
         ``(bande PIL RGB, ChapterMeta)`` avec ``chunk_sizes`` renseigné.
     """
+    on_asura = asura.is_asura_url(url)
     with _session_scope(session) as http:
         meta = fetch_chapter_image_urls(url, session=http, language=language)
-        images = download_images(meta.image_urls, session=http, delay=delay)
+        images = download_images(meta.image_urls, session=http, delay=delay, referer=asura.REFERER if on_asura else None)
+    if on_asura:
+        images = _drop_credit_banners(images, meta)
     meta.chunk_sizes = [(img.width, img.height) for img in images]
     strip = stitch_webtoon_pages(images)
     # Les morceaux PIL ne sont plus utiles une fois la bande assemblée.
     del images
     return strip, meta
+
+
+def _drop_credit_banners(images: list[Image.Image], meta: ChapterMeta) -> list[Image.Image]:
+    """Retire les bannières de crédits d'Asura (images et URLs) ; jamais toutes les pages."""
+    portrait = [img.width for img in images if img.height >= img.width]
+    if len(images) < 2 or not portrait:
+        return images
+    page_width = Counter(portrait).most_common(1)[0][0]
+    keep = [i for i, img in enumerate(images) if not asura.is_credits_banner(img.size, page_width)]
+    if len(keep) == len(images) or not keep:
+        return images
+    for i in sorted(set(range(len(images))) - set(keep)):
+        logger.info("Banniere de credits ecartee (%dx%d) : %s", images[i].width, images[i].height, meta.image_urls[i])
+    meta.image_urls = [meta.image_urls[i] for i in keep]
+    return [images[i] for i in keep]
 
 
 def save_strip(strip: Image.Image, path: str | Path) -> Path:

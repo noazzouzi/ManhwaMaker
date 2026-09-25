@@ -127,7 +127,7 @@ def test_load_pronunciations_default_file_and_validation(tmp_path, monkeypatch) 
 
 
 def test_resolve_voice_defaults_to_american_english() -> None:
-    assert resolve_voice() == ("a", "am_puck")
+    assert resolve_voice() == ("a", "am_fenrir,am_michael")
     assert resolve_voice("en", "af_heart") == ("a", "af_heart")
     assert resolve_voice("FR") == ("f", "ff_siwis")
     with pytest.raises(TTSError, match="Langue"):
@@ -169,21 +169,22 @@ def test_export_mp3(tmp_path) -> None:
 # --- Moteur ------------------------------------------------------------------------------
 def test_synthesize_scene_adds_exact_padding_and_applies_pronunciations(tmp_path) -> None:
     pipeline = FakePipeline()
-    tts = KokoroTTS(pipeline=pipeline, pronunciations={"Destia": "Dess-tee-ah"})
+    pad = 0.18  # le silence de fin n'est plus ajoute par defaut, mais reste reglable
+    tts = KokoroTTS(pipeline=pipeline, pronunciations={"Destia": "Dess-tee-ah"}, padding_s=pad)
     scene = _scene(3, "Destia roars at the young man", emotion="epic")
     audio = tts.synthesize_scene(scene, tmp_path / "scene_003.wav")
 
     assert pipeline.calls[0]["text"] == "Dess-tee-ah roars at the young man."
-    assert pipeline.calls[0]["voice"] == "am_puck" and pipeline.calls[0]["speed"] == 1.0
+    assert pipeline.calls[0]["voice"] == "am_fenrir,am_michael" and pipeline.calls[0]["speed"] == 1.0
     n_words = 6
     expected_speech = int(n_words * SECONDS_PER_WORD * SAMPLE_RATE) / SAMPLE_RATE
     assert audio.speech_s == pytest.approx(expected_speech)
-    assert audio.duration_s == pytest.approx(expected_speech + DEFAULT_PADDING_S)
+    assert audio.duration_s == pytest.approx(expected_speech + pad)
     assert audio.scene_index == 3 and audio.file == "scene_003.wav" and audio.emotion == "epic"
     assert audio.sample_rate == SAMPLE_RATE and audio.text.startswith("Dess-tee-ah")
     samples, rate = read_wav(tmp_path / "scene_003.wav")
     assert rate == SAMPLE_RATE and len(samples) == round(audio.duration_s * SAMPLE_RATE)
-    tail = samples[-int(DEFAULT_PADDING_S * SAMPLE_RATE) :]
+    tail = samples[-int(pad * SAMPLE_RATE) :]
     assert np.all(tail == 0.0)  # silence de fin exact
     assert np.abs(samples[: len(samples) - len(tail)]).min() > 0.2  # parole non nulle
 
@@ -196,24 +197,27 @@ def test_sentence_gap_between_sentences(tmp_path) -> None:
         "One two.", "Three four five!", '"Six" seven? eight... nine.',
     ]
     assert split_sentences("Mr. Kim waits. He waits again.") == ["Mr.", "Kim waits.", "He waits again."]
+    # Pause ajoutee (reglage explicite) : une synthese par phrase, silence exact entre les deux.
+    gap = 0.2
     pipeline = FakePipeline()
-    tts = KokoroTTS(pipeline=pipeline, pronunciations={})
+    tts = KokoroTTS(pipeline=pipeline, pronunciations={}, sentence_gap_s=gap)
     audio = tts.synthesize_scene(_scene(0, "One two. Three four five"), tmp_path / "s.wav")
     assert [c["text"] for c in pipeline.calls] == ["One two.", "Three four five."]  # une synthese par phrase
-    expected = int(2 * SECONDS_PER_WORD * SAMPLE_RATE) / SAMPLE_RATE + DEFAULT_SENTENCE_GAP_S + int(3 * SECONDS_PER_WORD * SAMPLE_RATE) / SAMPLE_RATE
+    expected = int(2 * SECONDS_PER_WORD * SAMPLE_RATE) / SAMPLE_RATE + gap + int(3 * SECONDS_PER_WORD * SAMPLE_RATE) / SAMPLE_RATE
     assert audio.speech_s == pytest.approx(expected)
-    assert audio.duration_s == pytest.approx(expected + DEFAULT_PADDING_S)
     samples, _ = read_wav(tmp_path / "s.wav")
     gap_start = int(2 * SECONDS_PER_WORD * SAMPLE_RATE)
-    assert np.all(samples[gap_start : gap_start + int(DEFAULT_SENTENCE_GAP_S * SAMPLE_RATE)] == 0.0)
-    # Pause desactivee : un seul bloc, aucun silence intermediaire.
+    assert np.all(samples[gap_start : gap_start + int(gap * SAMPLE_RATE)] == 0.0)
+    # Defaut : la scene est lue d'un seul bloc, les pauses sont laissees a Kokoro (ponctuation),
+    # et aucun silence n'est ajoute en fin de scene.
     pipeline = FakePipeline()
-    tts = KokoroTTS(pipeline=pipeline, pronunciations={}, sentence_gap_s=0.0)
+    tts = KokoroTTS(pipeline=pipeline, pronunciations={})
     audio = tts.synthesize_scene(_scene(1, "One two. Three four five"), tmp_path / "t.wav")
     assert len(pipeline.calls) == 1 and audio.speech_s == pytest.approx(int(5 * SECONDS_PER_WORD * SAMPLE_RATE) / SAMPLE_RATE)
+    assert audio.duration_s == pytest.approx(audio.speech_s)
     with pytest.raises(ValueError):
         KokoroTTS(pipeline=FakePipeline(), sentence_gap_s=-0.1)
-    assert DEFAULT_PADDING_S == 0.18 and DEFAULT_SENTENCE_GAP_S == 0.2
+    assert DEFAULT_PADDING_S == 0.0 and DEFAULT_SENTENCE_GAP_S == 0.0
 
 
 def test_synthesize_handles_tuple_results_speed_and_errors(tmp_path) -> None:
@@ -243,9 +247,9 @@ def test_synthesize_analysis_skips_filler_and_writes_manifest(tmp_path) -> None:
 
     assert isinstance(manifest, VoiceoverManifest)
     assert [item.scene_index for item in manifest.items] == [0, 2]
-    assert manifest.voice == "am_puck" and manifest.lang_code == "a" and manifest.language == "en"
+    assert manifest.voice == "am_fenrir,am_michael" and manifest.lang_code == "a" and manifest.language == "en"
     assert manifest.padding_s == DEFAULT_PADDING_S and manifest.sample_rate == SAMPLE_RATE
-    assert manifest.sentence_gap_s == 0.2
+    assert manifest.sentence_gap_s == 0.0
     assert manifest.total_duration_s == pytest.approx(sum(i.duration_s for i in manifest.items))
     assert manifest.full_file == "voiceover_full.wav"
     files = sorted(p.name for p in (tmp_path / "audio").iterdir())

@@ -208,8 +208,9 @@ def test_pacing_weighs_panels_by_their_native_height() -> None:
 def test_montage_uses_the_upscaled_figures(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.models.scene import ChapterAnalysis, Scene
 
-    figures_map = [{"index": 0, "x0": 0, "y0": 0, "x1": 10, "y1": 10, "reading_panels": [0]}]
+    figures_map = [{"index": 0, "x0": 0, "y0": 0, "x1": 400, "y1": 500, "reading_panels": [0]}]
     monkeypatch.setattr(pipeline_mod, "ensure_figures", lambda out_dir, options, force=False: figures_map)
+    monkeypatch.setattr(pipeline_mod, "load_panels_meta", lambda panels_dir: [{"index": 0}])
     hd = tmp_path / FIGURES_DIRNAME / "hd_1920x1080"
     calls = []
 
@@ -221,10 +222,10 @@ def test_montage_uses_the_upscaled_figures(tmp_path, monkeypatch: pytest.MonkeyP
     analysis = ChapterAnalysis(model="m", language="en", n_panels=1, scenes=[
         Scene(index=0, panel_ids=[0], narration="Hello there.", emotion="calm")])
     result = PipelineResult(out_dir=tmp_path)
-    panels_dir, display = pipeline_mod._montage_panels(analysis, tmp_path, PipelineOptions(), result)
+    panels_dir, display, _ = pipeline_mod._montage_panels(analysis, tmp_path, PipelineOptions(), result)
     assert panels_dir == hd and calls == [FRAME] and display.scenes[0].panel_ids == [0]
 
-    panels_dir, _ = pipeline_mod._montage_panels(analysis, tmp_path, PipelineOptions(figure_upscale=False), result)
+    panels_dir, _, _ = pipeline_mod._montage_panels(analysis, tmp_path, PipelineOptions(figure_upscale=False), result)
     assert panels_dir == tmp_path / FIGURES_DIRNAME and calls == [FRAME]
 
 

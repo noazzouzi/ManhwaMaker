@@ -53,9 +53,9 @@ SHORT_SPEED: float = 1.20
 SHORT_MAX_SILENCE_S: float = 0.1
 #: Accélération de la voix en format long. Même mécanisme que :data:`SHORT_SPEED` : Kokoro
 #: parle plus vite à la synthèse, la hauteur de voix ne monte donc pas. Elle raccourcit
-#: mécaniquement la vidéo, puisque la durée de chaque paragraphe suit sa narration.
-#: ``--speed`` sur la ligne de commande continue de primer.
-LONG_SPEED: float = 1.15
+#: mécaniquement la vidéo, puisque la durée de chaque paragraphe suit sa narration : les
+#: cases restent calées sur la voix. ``--speed`` sur la ligne de commande continue de primer.
+LONG_SPEED: float = 1.4
 
 #: Polices d'affichage du mode SHORT, de la plus grasse à la plus sûre. Futura est une
 #: police commerciale, absente de la machine : Montserrat Black (graisse 900, licence
@@ -101,7 +101,7 @@ def _long_profile() -> FormatProfile:
             # 0,9222 = (1080 - 84) / 1080 : reproduit au pixel la marge basse historique.
             fill=WHITE, highlight_color=None, highlight_current_word=False, vertical_anchor=0.92222,
         ),
-        audio=AudioRules(speed=LONG_SPEED, sentence_gap_s=0.2, padding_s=0.18, max_internal_silence_s=None),
+        audio=AudioRules(speed=LONG_SPEED, sentence_gap_s=0.0, padding_s=0.0, max_internal_silence_s=None),
         outro=OutroRules(enabled=False),
     )
 
@@ -127,7 +127,7 @@ def _short_profile() -> FormatProfile:
             fill=WHITE, highlight_color=YELLOW, highlight_current_word=True, vertical_anchor=0.74,
         ),
         audio=AudioRules(
-            speed=SHORT_SPEED, sentence_gap_s=0.05, padding_s=0.05,
+            speed=SHORT_SPEED, sentence_gap_s=0.0, padding_s=0.0,
             max_internal_silence_s=SHORT_MAX_SILENCE_S,
         ),
         outro=OutroRules(enabled=True, duration_s=5.0, motion_blur=True, font_size_px=120),

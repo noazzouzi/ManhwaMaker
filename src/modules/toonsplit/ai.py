@@ -473,7 +473,9 @@ class ClaudeCliJson(JsonClient):
     Claude Code n'est pas envoyé), aucun outil, session non enregistrée, sortie structurée
     validée par ``--json-schema``, images en base64 (entrée ``stream-json``). Aucun fichier
     de réglages n'est chargé (``--setting-sources ""``) : sans cela le ``CLAUDE.md`` global de
-    l'utilisateur (« Réponds en français »...) s'invite dans chaque requête. Modèle explicite
+    l'utilisateur (« Réponds en français »...) s'invite dans chaque requête. Aucun serveur MCP
+    non plus (``--strict-mcp-config``) : les connecteurs claude.ai du compte ajoutaient ~19 000
+    jetons de définitions d'outils à chaque appel (0,19 $ par appel Opus, mesuré le 25/09). Modèle explicite
     (défaut :data:`CLAUDE_DEFAULT_MODEL`) pour que le cache ne mélange pas deux modèles.
     """
 
@@ -496,7 +498,7 @@ class ClaudeCliJson(JsonClient):
     def command(self, system: str, schema: type[BaseModel]) -> list[str]:
         cmd = [
             self.executable or find_claude(), "-p", "--input-format", "stream-json", "--output-format", "stream-json",
-            "--verbose", "--tools", "", "--no-session-persistence", "--setting-sources", "", "--system-prompt", system,
+            "--verbose", "--tools", "", "--no-session-persistence", "--setting-sources", "", "--strict-mcp-config", "--system-prompt", system,
             "--json-schema", json.dumps(_inline_refs(schema.model_json_schema())), "--model", self.model,
         ]
         if self.effort:

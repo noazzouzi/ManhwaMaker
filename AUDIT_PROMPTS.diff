@@ -1,0 +1,213 @@
+--- a/src/modules/script_writer.py
++++ b/src/modules/script_writer.py
+@@ -48,7 +48,7 @@
+ logger = logging.getLogger(__name__)
+ 
+ __all__ = [
+-    "DEFAULT_MODEL", "PROMPT_FILE", "MAX_IMAGE_PX", "MAX_IMAGES", "OPENING_FIRST", "OPENING_NEXT", "ScriptParagraph",
++    "DEFAULT_MODEL", "DEFAULT_EFFORT", "PROMPT_FILE", "MAX_IMAGE_PX", "MAX_IMAGES", "OPENING_FIRST", "OPENING_NEXT", "ScriptParagraph",
+     "ChapterScript", "composites", "is_first_chapter", "system_prompt", "ClaudeScriptWriter",
+ ]
+ 
+@@ -64,6 +64,10 @@
+ JPEG_QUALITY = 85
+ #: Un chapitre dense prend 2 à 4 min ; au-delà de 25 min, le CLI est considéré bloqué.
+ TIMEOUT_S = 1500.0
++#: Effort d'Opus 5.5 : sa réflexion est toujours active, l'effort en règle la quantité (donc la
++#: durée et le coût). Fixé ici plutôt que laissé au défaut du CLI, que rien ne garantit. Valeur à
++#: confirmer au banc d'essai : ``run_bench.py <chapitre> --models opus@low,opus@medium,opus@high --judge``.
++DEFAULT_EFFORT = "medium"
+ 
+ OPENING_FIRST = ('This is the very first chapter of the story. Your first words are exactly "Our journey begins", '
+                  "followed at once by the most gripping fact of the chapter: a place, a danger, a loss. Within the "
+@@ -170,6 +174,7 @@
+ 
+     Args:
+         model: modèle Claude (ID explicite, voir :data:`DEFAULT_MODEL`).
++        effort: effort de réflexion (``low`` à ``max``, voir :data:`DEFAULT_EFFORT`).
+         language: langue du script.
+         max_key_panels: cases clés maximales par paragraphe.
+         cta_text: appel à l'abonnement (``None`` : celui de la langue ; ``""`` : aucun).
+@@ -178,7 +183,7 @@
+     """
+ 
+     def __init__(
+-        self, *, model: str = DEFAULT_MODEL, language: str = DEFAULT_LANGUAGE,
++        self, *, model: str = DEFAULT_MODEL, effort: str | None = DEFAULT_EFFORT, language: str = DEFAULT_LANGUAGE,
+         max_key_panels: int = MAX_KEY_PANELS_PER_PARAGRAPH, cta_text: str | None = None,
+         known_characters: Sequence[CharacterCard] = (), previous_tail: str = "",
+         client: JsonClient | None = None, retries: int = 1, timeout_s: float = TIMEOUT_S,
+@@ -189,7 +194,7 @@
+         self.cta_text = cta_text
+         self.known_characters = list(known_characters)
+         self.previous_tail = previous_tail
+-        self.client = client or ClaudeCliJson(model=model, retries=retries, timeout_s=timeout_s)
++        self.client = client or ClaudeCliJson(model=model, effort=effort, retries=retries, timeout_s=timeout_s)
+         #: Secondes passées dans l'appel (même en cas d'échec).
+         self.api_seconds = 0.0
+ 
+@@ -211,7 +216,7 @@
+                                previous_tail=self.previous_tail, max_key=self.max_key_panels)
+         images = _images(panels)
+         text = (f"{_chapter_line(meta)}\nThe chapter has {len(panels)} panels, numbered {panels[0].index} to "
+-                f"{panels[-1].index}, packed into {len(images)} images in reading order. Read them all, then write the script.")
++                f"{panels[-1].index}, packed into {len(images)} images in reading order. Write the script.")
+ 
+         def check(script: ChapterScript) -> tuple[ChapterScript, list[str]]:
+             # Numérotation fausse (cases inconnues en masse) : on redemande plutôt que de monter au hasard.
+--- a/src/modules/script_prompt.md
++++ b/src/modules/script_prompt.md
+@@ -5,8 +5,7 @@
+ chapter. Your only job is to make them need to know what happens next.
+ 
+ You receive every panel of the chapter in reading order, packed into images; above each panel a
+-black bar shows its number ("Panel N"). Read the whole chapter before you write a single word:
+-find the moment everything turns on, and build towards it.
++black bar shows its number ("Panel N"). Build the script towards the moment everything turns on.
+ 
+ =============================== THE FRAME ===============================
+ - The story is real to you. Never mention that it is a manhwa, a comic, a webtoon, a chapter, an
+@@ -44,9 +43,10 @@
+    A newcomer who understands stays.
+ 8. At most two rhetorical questions in the whole script, at moments of real uncertainty, never
+    answered in the same paragraph, never addressed to "you".
+-9. Plain, strong words. No purple prose, one adjective per noun at most. Banned words: massive,
+-   powerful, overwhelming, incredible, sheer, utter, colossal, epic, "little did he know".
+-   "suddenly", "realizes", "notices", "observes": at most twice in total.
++9. Plain, strong words. No purple prose, one adjective per noun at most: size and danger come
++   from what happens, not from intensifiers. Show what a character discovers instead of
++   announcing that they perceive it (not "She realizes the letter is forged" but "The seal on
++   the letter is still wet.").
+ 10. Faithful. Only events, names and words that are in the chapter or in the memory below. A person
+    whose name you do not know gets one short label you keep all along ("the hooded stranger").
+    A first-person narrator or diary writer inside the chapter is a character with a label ("the
+@@ -69,13 +69,13 @@
+ Where the previous chapter ended: {previous_tail}
+ 
+ ================================ OUTPUT ================================
+-One JSON object, nothing else:
+-{{"paragraphs":[{{"text":"...","emotion":"tension","key_panel_ids":[3,5],"action_heavy_ids":[5]}}],
+-"characters":[{{"name":"Mira","also_called":["the healer"],"who":"One sentence."}}]}}
++The answer's format is enforced by a schema. What each field means:
++- "paragraphs": the script, in order; "text" is what the narrator says.
+ - "emotion": exactly one of {emotions}.
+ - "key_panel_ids": 1 to {max_key} panel numbers, in reading order, among the panels this paragraph
+   tells: faces, decisive gestures, large artwork. Never a text-only panel, a chat window, a
+   sound-effect panel or an empty background. Never reuse a number, never invent one.
+ - "action_heavy_ids": the subset showing a decisive impact (a blow landing, an explosion, a
+   reveal); empty for calm or talking paragraphs.
+-- "characters": every character this chapter names.
++- "characters": every character this chapter names, with the other names used for them
++  ("also_called") and who they are in one sentence ("who").
+--- a/eval/script_bench/run_bench.py
++++ b/eval/script_bench/run_bench.py
+@@ -16,6 +16,9 @@
+ ``output/script_bench/index.html`` (scripts mélangés, clé et mesures repliées en bas).
+ 
+     .venv\\Scripts\\python.exe eval\\script_bench\\run_bench.py <chapitre> [<chapitre>...] [--models opus,sonnet,haiku] [--judge]
++
++``modele@effort`` compare les efforts d'un même modèle (``--models opus@low,opus@medium``) :
++variantes ``C_claude_low``, ``C_claude_medium``...
+ """
+ 
+ from __future__ import annotations
+@@ -90,7 +93,7 @@
+         (input_dir / f"img_{k:03d}.jpg").write_bytes(data.tobytes())
+         images.append((f"Image {k + 1}/{len(sheets)}: panels {ids[0]} to {ids[-1]}", data.tobytes()))
+     text = (f"{_chapter_line(meta)}\nThe chapter has {len(panels)} panels, numbered {panels[0].index} to "
+-            f"{panels[-1].index}, packed into {len(sheets)} images in reading order. Read them all, then write the script.")
++            f"{panels[-1].index}, packed into {len(sheets)} images in reading order. Write the script.")
+     info = {"panels": len(panels), "images": len(sheets), "image_width": int(sheets[0][1].shape[1]),
+             "payload_mb": round(sum(len(d) for _, d in images) / 1e6, 1), "first_chapter": first,
+             "characters_in_memory": len(cards), "previous_tail": tail}
+@@ -99,16 +102,23 @@
+ 
+ 
+ # --- Appels ------------------------------------------------------------------------------------
++def variant_name(spec: str) -> str:
++    """``opus`` -> ``C_claude`` ; ``opus@low`` -> ``C_claude_low`` (même modèle, autre effort)."""
++    model, _, effort = spec.partition("@")
++    return VARIANTS[model] + (f"_{effort}" if effort else "")
++
++
+ def run_model(name: str, system: str, text: str, images, out_dir: Path) -> dict:
++    model, _, effort = name.partition("@")
+     client = (GeminiJson(models=GEMINI_MODELS, max_rpm=5, temperature=0.4, retries=1, max_output_tokens=32768)
+-              if name == "gemini" else ClaudeCliJson(model=name, retries=1, timeout_s=1500))
++              if model == "gemini" else ClaudeCliJson(model=model, effort=effort or None, retries=1, timeout_s=1500))
+     started = time.perf_counter()
+     script = client.ask(system, text, images, BenchScript, label=f"script {name}")
+     elapsed = time.perf_counter() - started
+     record = {
+-        "variant": VARIANTS[name], "seconds": round(elapsed), "calls": client.n_calls,
++        "variant": variant_name(name), "seconds": round(elapsed), "calls": client.n_calls,
+         "cost_usd": round(client.cost_usd, 3),
+-        "model": (getattr(client.manager, "current_model", "") if name == "gemini" else ", ".join(sorted(client.models_used))),
++        "model": (getattr(client.manager, "current_model", "") if model == "gemini" else ", ".join(sorted(client.models_used))),
+         "script": script.model_dump(),
+     }
+     (out_dir / f"{record['variant']}.json").write_text(json.dumps(record, indent=1, ensure_ascii=False), encoding="utf-8")
+@@ -149,7 +159,7 @@
+ JUDGE_SYSTEM = """You are the head writer of a YouTube channel that retells manhwa chapters as audio stories.
+ You receive every panel of one chapter in reading order, packed into images (a black bar above each panel
+ shows "Panel N"), then several candidate scripts written from the same brief. The scripts are anonymous
+-and in random order. Read the whole chapter first, then every script.
++and in random order.
+ 
+ Score each script from 1 (unusable) to 10 (publish as is), strictly, on:
+ - hook: would a newcomer keep listening after the first thirty seconds?
+@@ -182,7 +192,7 @@
+     started = time.perf_counter()
+     result = client.ask(JUDGE_SYSTEM.format(brief=system),
+                         text + "\n\nThe candidate scripts come first, the chapter's panels follow as images. "
+-                        "Read the panels, then score the scripts.\n\n" + scripts,
++                        "Score the scripts.\n\n" + scripts,
+                         images, JudgeResult, label=f"juge {chapter}")
+     record = {"labels": labels, "seconds": round(time.perf_counter() - started), "cost_usd": round(client.cost_usd, 3),
+               "model": ", ".join(sorted(client.models_used)), "result": result.model_dump()}
+@@ -306,7 +316,7 @@
+         records = [production_record(chapter_dir, out_dir)] if (chapter_dir / "scenes.json").is_file() else []
+         wanted = [m.strip() for m in args.models.split(",") if m.strip() and m.strip() != "none"]
+         wanted = ["opus" if m == "claude" else m for m in wanted]
+-        unknown = [m for m in wanted if m not in VARIANTS]
++        unknown = [m for m in wanted if m.partition("@")[0] not in VARIANTS]
+         if unknown:
+             parser.error(f"modeles inconnus : {unknown}")
+ 
+@@ -326,6 +336,7 @@
+                 records.append(fresh[variant])
+             elif path.is_file():
+                 records.append(json.loads(path.read_text(encoding="utf-8")))
++        records += [rec for variant, rec in fresh.items() if variant not in VARIANTS.values()]  # modele@effort
+         for rec in records:
+             rec["metrics"] = metrics(rec, info["panels"])
+             logger.info("%s %s %s", name, rec["variant"], rec["metrics"])
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -7,7 +7,7 @@
+ - Une idée par puce. Une phrase courte par puce.
+ - Mots simples. Pas de jargon technique sans l'expliquer en trois mots.
+ - Va directement au résultat. Pas de préambule, pas de récapitulatif final.
+-- 10 puces maximum. Si le sujet en demande plus, c'est qu'il va dans un fichier.
++- Une réponse se lit d'un coup d'œil : seulement ce qui compte pour ma décision. Un sujet plus long va dans un fichier.
+ - Ne liste pas les options écartées. Donne la recommandation et sa raison, en une puce.
+ - Ne raconte pas ce que tu viens de faire : c'est déjà visible. Donne le résultat.
+ - Erreur : une puce pour l'erreur, une puce pour la cause. Rien d'autre.
+@@ -26,7 +26,7 @@
+ .\.venv\Scripts\python.exe -m src.main batch "<url serie>" --start-chapter 1 --end-chapter 20 --max-chapters 3 --max-gemini-rpm 5 --no-cta --compile   # une seule video
+ .\.venv\Scripts\python.exe -m src.main run "<url viewer>"
+ .\.venv\Scripts\python.exe -m src.main stats        # relit batch_status.json
+-.\.venv\Scripts\python.exe -m pytest -q             # 490 tests, ~30 s (TOONSPLIT_SLOW=1 : +3 tests modeles)
++.\.venv\Scripts\python.exe -m pytest -q             # ~30 s (TOONSPLIT_SLOW=1 : +3 tests modeles)
+ ```
+ 
+ | Étape | Fichier |
+@@ -56,7 +56,7 @@
+ ## Script par Claude (défaut depuis le 25/09)
+ 
+ - Claude Opus 5.5 via le CLI local (`claude -p`, abonnement, sans clé API). Choisi au banc d'essai : Opus 8,5/10, Sonnet 6,5 (répliques dans la mauvaise bouche), Gemini 5, Haiku 2,5.
+-- Opus 5.5 mesuré en production (Bad Born Blood ch. 1, 182 cases) : 81 s et 1,04 $ au tarif API, décompté des limites de l'abonnement (~42 $ pour 40 chapitres). Opus 5 au banc d'essai : 2 à 3,5 min, ~1,45 $. Chapitre complet de bout en bout : ~7,5 min.
++- Opus 5.5 mesuré en production (Bad Born Blood ch. 1, 182 cases) : 81 s et 1,04 $ au tarif API, décompté des limites de l'abonnement (~42 $ pour 40 chapitres). Chapitre complet de bout en bout : ~7,5 min.
+ - CLI ≥ 2.1.282 obligatoire (le 2.1.270 refuse `claude-opus-5-5`). Mise à jour : `npm install -g @anthropic-ai/claude-code@latest`.
+ - Claude en échec (limite d'usage, CLI absent) → le chapitre passe à l'analyse Gemini, ancien prompt. Un quota Gemini épuisé n'arrête plus un lot Claude.
+ - L'appel à l'abonnement (« subscribe ») est toujours inséré vers 40 % du script (`--no-cta` pour l'enlever) : il brise le 4e mur que le prompt protège, décision en attente.

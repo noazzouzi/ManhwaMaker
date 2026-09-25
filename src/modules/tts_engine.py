@@ -6,9 +6,11 @@ Pipeline :
    caractères invisibles, espaces) et :func:`apply_pronunciations` applique le
    **dictionnaire de remplacement phonétique** (garde-fou n°3 du PRD) aux noms
    propres, avant toute synthèse ;
-2. :class:`KokoroTTS` synthétise chaque scène avec ``KPipeline`` (100 % local,
-   24 kHz), concatène les morceaux produits par Kokoro et ajoute
-   :data:`DEFAULT_PADDING_S` = 0,18 s de silence en fin de segment ;
+2. :class:`KokoroTTS` synthétise chaque scène d'un seul tenant avec ``KPipeline``
+   (100 % local, 24 kHz) : les pauses viennent de la ponctuation, Kokoro les place
+   lui-même (mesuré : 0,1 à 0,6 s aux points et virgules, ~0,8 à 1,2 s entre deux
+   scènes avec ses silences naturels de début et de fin). Aucun silence n'est ajouté
+   par défaut ;
 3. chaque segment est écrit en WAV 16 bits et décrit par un
    :class:`~src.models.audio.SceneAudio` dont ``duration_s`` est la durée
    **exacte** (nombre d'échantillons / fréquence) qui pilotera la timeline ;
@@ -17,8 +19,8 @@ Pipeline :
    défaut), écrit ``voiceover.json`` et, optionnellement, la voix off complète
    concaténée pour écoute.
 
-Langue : anglais américain par défaut (voix masculine ``am_puck``, 161 mots/min au
-banc d'essai de :mod:`src.modules.voice_lab`), cf.
+Langue : anglais américain par défaut (voix masculine :data:`DEFAULT_ENGLISH_VOICE`, mélange
+de ``am_fenrir`` et ``am_michael``), cf.
 :data:`LANGUAGE_VOICES` pour les autres langues. Les pipelines non anglais et
 les mots hors dictionnaire s'appuient sur espeak-ng (fourni par
 ``espeakng-loader`` sur Windows).
@@ -52,13 +54,14 @@ logger = logging.getLogger(__name__)
 KOKORO_REPO_ID: str = "hexgrad/Kokoro-82M"
 #: Fréquence d'échantillonnage de Kokoro (Hz).
 SAMPLE_RATE: int = 24_000
-#: Silence ajouté en fin de chaque segment (secondes) : 0,18 s, assez pour ne jamais
-#: chevaucher la phrase suivante tout en resserrant le rythme entre les scènes.
-DEFAULT_PADDING_S: float = 0.18
-#: Silence inséré entre deux phrases d'un même segment (secondes) : chaque phrase est
-#: synthétisée séparément puis assemblée avec cette pause. 0,2 s suffit à marquer la
-#: respiration sans casser le rythme (0,4 s donnait une narration traînante).
-DEFAULT_SENTENCE_GAP_S: float = 0.2
+#: Silence ajouté en fin de chaque segment (secondes). 0 : Kokoro termine déjà chaque
+#: scène par ~0,5 à 0,9 s de silence naturel.
+DEFAULT_PADDING_S: float = 0.0
+#: Silence inséré entre deux phrases d'un même segment (secondes). 0 : la scène est lue
+#: d'un seul tenant et Kokoro règle les pauses selon la ponctuation. Au-dessus de 0, chaque
+#: phrase est synthétisée à part avec ses propres silences de début et de fin (~1 s entre
+#: deux phrases mesuré avec 0,2 s), d'où une narration hachée.
+DEFAULT_SENTENCE_GAP_S: float = 0.0
 DEFAULT_SPEED: float = 1.0
 #: Fichier du dictionnaire phonétique par défaut (racine du projet).
 DEFAULT_PRONUNCIATIONS_FILE: Path = PROJECT_ROOT / "config" / "pronunciations.json"
@@ -67,10 +70,15 @@ MANIFEST_NAME: str = "voiceover.json"
 #: Nom du WAV de la voix off complète.
 FULL_VOICEOVER_NAME: str = "voiceover_full.wav"
 
+#: Voix anglaise par défaut : mélange à parts égales de ``am_fenrir`` et ``am_michael``
+#: (Kokoro fait la moyenne des voix séparées par une virgule). Choisie à l'oreille le
+#: 25/09/2026 contre fenrir, michael et puck seules, toutes trois notées C+ par Kokoro.
+DEFAULT_ENGLISH_VOICE: str = "am_fenrir,am_michael"
+
 #: Langue de narration -> (code de pipeline Kokoro, voix par défaut).
 LANGUAGE_VOICES: dict[str, tuple[str, str]] = {
-    "en": ("a", "am_puck"),
-    "en-us": ("a", "am_puck"),
+    "en": ("a", DEFAULT_ENGLISH_VOICE),
+    "en-us": ("a", DEFAULT_ENGLISH_VOICE),
     "en-gb": ("b", "bf_emma"),
     "fr": ("f", "ff_siwis"),
     "es": ("e", "ef_dora"),

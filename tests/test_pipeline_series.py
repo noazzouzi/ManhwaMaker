@@ -41,8 +41,18 @@ def _analysis(characters: list[CharacterCard] | None = None, last: str = "The ga
 
 @pytest.fixture
 def fake_analyze(monkeypatch: pytest.MonkeyPatch) -> dict:
-    """Remplace l'analyzer Gemini ; enregistre les arguments de construction."""
+    """Remplace le rédacteur Claude et l'analyzer Gemini ; enregistre les arguments de construction."""
     seen: dict = {}
+
+    class FakeWriter:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = kwargs
+            self.api_seconds = 0.0
+
+        def analyze(self, panels, meta=None):
+            return _analysis([CharacterCard(name="Hugh", also_called=[], who="The rival.")])
+
+    monkeypatch.setattr(pipeline_mod, "ClaudeScriptWriter", FakeWriter)
 
     class FakeAnalyzer:
         def __init__(self, **kwargs):

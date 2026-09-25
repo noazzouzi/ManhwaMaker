@@ -14,7 +14,9 @@ Deux jeux de cases coexistent dans le dossier d'un chapitre :
 ``figures/figures_map.json`` relie chaque case personnage aux cases de lecture qu'elle
 recouvre ; :func:`remap_analysis` traduit l'analyse (numéros de cases de lecture) en
 numéros de cases personnages juste avant le montage. Rien n'est recalculé côté IA quand
-les réglages des personnages changent.
+les réglages des personnages changent. :func:`select_figures` écarte au passage les
+personnages trop petits pour le cadre et les détections douteuses que le script n'a pas
+choisies.
 
 Les cases personnages se calculent sur le strip **reconstitué à partir des cases de
 lecture** (gouttières remises en blanc) : même résultat que le chapitre vienne d'être
@@ -26,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -49,6 +52,15 @@ FIGURES_VERSION = 2
 #: Part minimale de la hauteur d'un personnage qu'une case de lecture doit recouvrir pour
 #: lui être rattachée (un personnage à cheval sur deux cases appartient aux deux).
 MIN_READING_SHARE = 0.3
+#: Agrandissement au-delà duquel un personnage est trop petit pour être monté : il lui
+#: faudrait plus de x3 pour remplir 90 % du cadre. Ce sont des silhouettes de fond
+#: (villageois au loin), floues même agrandies par IA.
+MAX_MONTAGE_FACTOR = 3.0
+#: Confiance minimale du détecteur pour un personnage que le script n'a pas choisi (ajouté
+#: entre deux cases clés) : en dessous, fausses détections (pointe de bulle prise pour une
+#: personne). Pas plus haut : le détecteur note mal les gros plans de visage (0,41 à 0,49
+#: mesurés). Les cases clés, choisies par l'IA pour le récit, n'y sont pas soumises.
+MIN_EXTRA_SCORE = 0.4
 
 
 @dataclass(frozen=True)
@@ -222,7 +234,41 @@ def remap_analysis(analysis: ChapterAnalysis, figures_map: Sequence[dict[str, An
     return analysis.model_copy(update={"scenes": scenes, "beats": beats, "n_panels": len(figures_map)})
 
 
+def _size(entry: dict[str, Any]) -> tuple[int, int]:
+    return int(entry.get("w", entry["x1"] - entry["x0"])), int(entry.get("h", entry["y1"] - entry["y0"]))
+
+
+def big_enough(entry: dict[str, Any], frame: tuple[int, int], *, max_factor: float = MAX_MONTAGE_FACTOR) -> bool:
+    """Vrai si le personnage remplit 90 % du cadre avec un agrandissement d'au plus ``max_factor``."""
+    from src.modules.upscaler import DEFAULT_FILL, target_factor
+
+    width, height = _size(entry)
+    return target_factor(width, height, frame[0], frame[1], fill=DEFAULT_FILL, max_factor=math.inf) <= max_factor
+
+
+def select_figures(
+    analysis: ChapterAnalysis, figures_map: Sequence[dict[str, Any]], frame: tuple[int, int], *,
+    max_factor: float = MAX_MONTAGE_FACTOR, min_extra_score: float = MIN_EXTRA_SCORE,
+) -> tuple[ChapterAnalysis, list[int]]:
+    """Personnages à monter : ``(analyse traduite, numéros des cases personnages montables)``.
+
+    Un personnage trop petit pour le cadre (voir :data:`MAX_MONTAGE_FACTOR`) n'est jamais
+    monté, même choisi par le script : sa scène reçoit alors le personnage montable le plus
+    proche. Parmi les autres, ceux que le script n'a pas choisis (le montage les ajoute
+    entre deux cases clés) doivent en plus être détectés avec une confiance d'au moins
+    ``min_extra_score``. Liste vide (analyse inchangée) si aucun personnage n'est assez grand.
+    """
+    big = [entry for entry in figures_map if big_enough(entry, frame, max_factor=max_factor)]
+    if not big:
+        return analysis, []
+    display = remap_analysis(analysis, big)
+    keys = {pid for scene in display.scenes for pid in scene.panel_ids}
+    ids = sorted(int(e["index"]) for e in big if int(e["index"]) in keys or float(e.get("score", 1.0)) >= min_extra_score)
+    return display, ids
+
+
 __all__ = [
-    "FIGURES_DIRNAME", "MAP_FILE", "PARAMS_FILE", "FIGURES_VERSION", "FigureOptions", "strip_from_panels",
-    "reading_ids_for", "build_figure_panels", "load_figures_map", "ensure_figures", "remap_analysis",
+    "FIGURES_DIRNAME", "MAP_FILE", "PARAMS_FILE", "FIGURES_VERSION", "MAX_MONTAGE_FACTOR", "MIN_EXTRA_SCORE",
+    "FigureOptions", "strip_from_panels", "reading_ids_for", "build_figure_panels", "load_figures_map",
+    "ensure_figures", "remap_analysis", "big_enough", "select_figures",
 ]

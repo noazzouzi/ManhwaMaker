@@ -228,16 +228,17 @@ class AudioRules(BaseModel):
     Attributes:
         speed: vitesse de lecture Kokoro. L'accélération se fait **à la synthèse** : un
             rééchantillonnage a posteriori (``pydub.speedup``) monterait la hauteur de voix.
-        sentence_gap_s: silence entre deux phrases d'une même scène.
-        padding_s: silence en fin de scène.
+        sentence_gap_s: silence ajouté entre deux phrases d'une même scène (0 = scène lue
+            d'un seul tenant, pauses laissées à Kokoro selon la ponctuation).
+        padding_s: silence ajouté en fin de scène (0 = silence naturel de Kokoro seul).
         max_internal_silence_s: silence interne toléré ; au-delà il est rogné après
             synthèse (``None`` = aucun rognage).
         silence_threshold_db: seuil sous lequel un passage est considéré comme silencieux.
     """
 
     speed: float = Field(gt=0, default=1.0)
-    sentence_gap_s: float = Field(ge=0, default=0.2)
-    padding_s: float = Field(ge=0, default=0.18)
+    sentence_gap_s: float = Field(ge=0, default=0.0)
+    padding_s: float = Field(ge=0, default=0.0)
     max_internal_silence_s: float | None = None
     silence_threshold_db: float = -45.0
 

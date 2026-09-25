@@ -178,6 +178,7 @@ def test_claude_cli_call_shape(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cmd[:2] == ["claude.exe", "-p"]
     assert cmd[cmd.index("--tools") + 1] == "" and "--no-session-persistence" in cmd
     assert cmd[cmd.index("--setting-sources") + 1] == ""  # pas de CLAUDE.md utilisateur dans la requête
+    assert "--strict-mcp-config" in cmd  # pas de connecteurs claude.ai (19 000 jetons d'outils par appel)
     assert cmd[cmd.index("--system-prompt") + 1] == "SYSTEM\nline 2"
     assert cmd[cmd.index("--model") + 1] == "sonnet" and cmd[cmd.index("--effort") + 1] == "low"
     schema = cmd[cmd.index("--json-schema") + 1]

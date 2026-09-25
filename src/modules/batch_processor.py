@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from src.modules.scraper import discover_episodes, episode_url, parse_ids_from_url
+from src.modules.scraper import chapter_ids, discover_episodes, episode_url, is_series_url
 from src.pipeline import (
     PipelineOptions,
     PipelineResult,
@@ -197,7 +197,7 @@ def resolve_chapter_urls(
     start_chapter: int | None = None,
     end_chapter: int | None = None,
     url_list: str | Path | None = None,
-    discover: Callable[[str], dict[int, str]] | None = discover_episodes,
+    discover: Callable[[str], dict[int | float, str]] | None = discover_episodes,
 ) -> list[str]:
     """URLs des chapitres à traiter.
 
@@ -216,11 +216,11 @@ def resolve_chapter_urls(
         raise BatchError("Indiquer une URL de serie / d'episode ou --url-list")
     if start_chapter is not None and end_chapter is not None and end_chapter < start_chapter:
         raise BatchError("--end-chapter doit etre >= --start-chapter")
-    is_list = urlparse_path_tail(url) == "list"
-    _, episode_no = parse_ids_from_url(url)
+    is_list = is_series_url(url)
+    _, episode_no = chapter_ids(url)
     if start_chapter is None and end_chapter is None and not is_list:
         return [url]
-    episodes: dict[int, str] = {}
+    episodes: dict[int | float, str] = {}
     if discover is not None:
         try:
             episodes = discover(url)
@@ -231,20 +231,15 @@ def resolve_chapter_urls(
             return [episodes[n] for n in sorted(episodes)]  # toute la serie, telle que listee
         lo = start_chapter if start_chapter is not None else min(episodes)
         hi = end_chapter if end_chapter is not None else max(episodes)
-        missing = [n for n in range(lo, hi + 1) if n not in episodes]
+        # Les chapitres bonus (74.5 sur Asura) de la plage sont pris avec les entiers.
+        wanted = sorted({*range(int(lo), int(hi) + 1), *(n for n in episodes if lo <= n <= hi)})
+        missing = [n for n in wanted if n not in episodes]
         if missing:
-            logger.warning("Episodes absents de la liste Webtoons, URL derivee : %s", missing)
-        return [episodes.get(n) or episode_url(url, n) for n in range(lo, hi + 1)]
-    lo = start_chapter if start_chapter is not None else (episode_no or 1)
-    hi = end_chapter if end_chapter is not None else (episode_no or lo)
+            logger.warning("Episodes absents de la liste de la serie, URL derivee : %s", missing)
+        return [episodes.get(n) or episode_url(url, n) for n in wanted]
+    lo = start_chapter if start_chapter is not None else int(episode_no or 1)
+    hi = end_chapter if end_chapter is not None else int(episode_no or lo)
     return [episode_url(url, n) for n in range(lo, hi + 1)]
-
-
-def urlparse_path_tail(url: str) -> str:
-    from urllib.parse import urlparse
-
-    segments = [s for s in urlparse(url).path.split("/") if s]
-    return segments[-1] if segments else ""
 
 
 def series_predecessors(urls: Sequence[str]) -> dict[str, str]:
@@ -254,16 +249,16 @@ def series_predecessors(urls: Sequence[str]) -> dict[str, str]:
     c'est le N-1 qui écrit la fiche des personnages que le N va relire. Cette table dit,
     pour chaque chapitre du lot, lequel il doit attendre.
 
-    Deux séries différentes ne s'attendent jamais. Un chapitre sans ``title_no`` ou sans
-    ``episode_no`` n'attend personne et ne fait attendre personne : on ne sait pas où il
+    Deux séries différentes ne s'attendent jamais. Un chapitre sans série ou sans
+    numéro reconnaissable (:func:`chapter_ids`) n'attend personne et ne fait attendre personne : on ne sait pas où il
     se place, et le faire patienter le bloquerait pour rien.
     """
-    by_series: dict[int, list[tuple[int, str]]] = {}
+    by_series: dict[str, list[tuple[int | float, str]]] = {}
     for url in urls:
-        title_no, episode_no = parse_ids_from_url(url)
-        if title_no is None or episode_no is None:
+        series, episode_no = chapter_ids(url)
+        if series is None or episode_no is None:
             continue
-        by_series.setdefault(title_no, []).append((episode_no, url))
+        by_series.setdefault(series, []).append((episode_no, url))
 
     predecessors: dict[str, str] = {}
     for episodes in by_series.values():
@@ -409,8 +404,11 @@ async def process_batch(
             attempts=int(entry.get("attempts", 0)) + 1,
         )
         t0 = time.perf_counter()
+        # Quota Gemini epuise : seuls les lots ecrits par Gemini s'arretent. Claude ecrit sans
+        # quota Gemini ; Gemini n'y sert que de repli.
+        gemini_only = options.script_ai == "gemini"
         try:
-            if quota_hit.is_set():
+            if gemini_only and quota_hit.is_set():
                 raise QuotaExhaustedError("quota Gemini epuise sur toutes les cles et tous les modeles (chapitre precedent)")
             # Le scraping (reseau) avance pendant que d'autres chapitres consomment le quota Gemini.
             async with sem_scrape:
@@ -421,7 +419,7 @@ async def process_batch(
             )
             await wait_for_predecessor(url)
             async with sem_chapters:
-                if quota_hit.is_set():
+                if gemini_only and quota_hit.is_set():
                     raise QuotaExhaustedError("quota Gemini epuise sur toutes les cles et tous les modeles (chapitre precedent)")
                 analysis = await asyncio.to_thread(stages.analyze, meta, out_dir, options, result, manager=manager)
             analyzed[url].set()  # la fiche est ecrite : le chapitre suivant peut demarrer

@@ -1,7 +1,7 @@
 """Banc d'essai des voix Kokoro : même texte, toutes les voix, un rapport HTML comparatif.
 
 Sert à choisir la voix de la chaîne (:data:`~src.modules.tts_engine.LANGUAGE_VOICES`
-fixe ``am_puck`` par défaut) et, accessoirement, à mesurer le débit réel de Kokoro
+fixe le mélange ``am_fenrir,am_michael`` par défaut) et, accessoirement, à mesurer le débit réel de Kokoro
 sur cette machine (facteur temps réel, gain du parallélisme).
 
 Chaque voix synthétise le même extrait, avec le même dictionnaire phonétique et la
