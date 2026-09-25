@@ -2,13 +2,17 @@
 
 ## Style de réponse (prioritaire)
 
-- **Réponds en français, court.** Vise 5-15 lignes. Une réponse longue doit être justifiée par une demande explicite.
-- **Pas de préambule, pas de récapitulatif final.** Attaque directement par le résultat ou la réponse.
-- **Pas de tableau, pas de titres en gras à chaque paragraphe** sauf si je le demande ou si je compare vraiment plusieurs choses.
-- **Ne liste pas les options que tu n'as pas retenues.** Donne ta recommandation et sa raison en une ligne.
-- **Ne répète pas ce que tu viens de faire** si c'est visible dans les outils. Dis le résultat, pas le chemin parcouru.
-- Si un run échoue, donne l'erreur et la cause probable en 2 lignes, pas l'historique complet.
-- Les rapports longs (audit, redécouverte) vont dans un fichier, pas dans le chat.
+- Réponds en français.
+- **Uniquement des puces.** Jamais de paragraphes rédigés.
+- Une idée par puce. Une phrase courte par puce.
+- Mots simples. Pas de jargon technique sans l'expliquer en trois mots.
+- Va directement au résultat. Pas de préambule, pas de récapitulatif final.
+- 10 puces maximum. Si le sujet en demande plus, c'est qu'il va dans un fichier.
+- Ne liste pas les options écartées. Donne la recommandation et sa raison, en une puce.
+- Ne raconte pas ce que tu viens de faire : c'est déjà visible. Donne le résultat.
+- Erreur : une puce pour l'erreur, une puce pour la cause. Rien d'autre.
+- Pas de tableau sauf demande explicite ou vraie comparaison chiffrée.
+- Rapports longs (audit, revue) : dans un fichier, pas dans le chat.
 
 ## Le projet
 
@@ -21,21 +25,25 @@ Interpréteur : `.\.venv\Scripts\python.exe` (jamais `python` nu).
 .\.venv\Scripts\python.exe -m src.main batch "<url serie>" --start-chapter 1 --end-chapter 3 --max-chapters 3 --max-gemini-rpm 5
 .\.venv\Scripts\python.exe -m src.main run "<url viewer>"
 .\.venv\Scripts\python.exe -m src.main stats        # relit batch_status.json
-.\.venv\Scripts\python.exe -m pytest -q             # 249 tests, ~19 s
+.\.venv\Scripts\python.exe -m pytest -q             # 457 tests, ~30 s (TOONSPLIT_SLOW=1 : +3 tests modeles)
 ```
 
 | Étape | Fichier |
 |---|---|
-| scrape / découpe | `src/modules/scraper.py`, `slicer.py` |
+| scrape / découpe | `src/modules/scraper.py`, `slicer.py` (cases de lecture, lues par l'IA) ; `figure_panels.py` (cases personnages `figures/`, seules montées par défaut, `--panels slicer` pour l'ancien mode) |
+| upscale personnages | `src/modules/upscaler.py` (Real-ESRGAN anime ONNX → `figures/hd_<L>x<H>/`, seul dossier monté ; `--no-upscale` pour s'en passer) |
 | analyse Gemini | `src/modules/analyzer.py`, `src/utils/gemini_manager.py` |
+| memoire de serie | `src/modules/series_memory.py` (`characters.json` par chapitre) |
 | voix | `src/modules/tts_engine.py` |
 | montage | `src/modules/timeline_builder.py` |
 | sortie | `src/modules/capcut_builder.py`, `preview_renderer.py` (garder cohérents) |
 | lot | `src/modules/batch_processor.py` |
+| decoupe intelligente (test, hors pipeline) | `src/modules/toonsplit/`, `python -m src.modules.toonsplit` (voir `RAPPORT_TOONSPLIT.md`) |
 
 ## Règles non négociables (profil LONG)
 
 - Cases en **résolution native** sur fond flouté. Jamais d'upscale, jamais de recadrage.
+  Seule exception (décidée le 25/09) : les cases personnages, agrandies par IA (Real-ESRGAN) à 90 % du cadre, x4 max.
 - **Zoom ≤ 105 %** (`MAX_ZOOM` dans `timeline_builder.py`).
 - **Musique toujours présente**, BGM à −22 dB, bouclée.
 - Sous-titres 2-4 mots, contour 2 px.
@@ -56,6 +64,8 @@ Le profil **SHORT** (9:16) déroge volontairement aux deux premières règles (r
 - `--redo` n'existe que sur `batch`, pas sur `run`.
 - `batch --thumbnail` est accepté et ne fait rien.
 - `stage_montage` n'a aucun cache : timeline + CapCut + ffmpeg refaits à chaque passage.
+- Mode `figures` (défaut depuis le 24/09) : `scenes.json` reste en numéros de cases de lecture, la traduction vers `figures/` se fait au montage (`remap_analysis`). Extraction ~1,5 min/chapitre en CPU, en cache dans `figures/figures_params.json`. Les personnages d'une même case (même bande horizontale) sont regroupés en une image (`--figures-separate` pour les séparer). Ils sont ensuite agrandis par IA (`upscaler.py`) : ~4 s/chapitre sur GPU, ~85 s en CPU, en cache dans `hd_<L>x<H>/upscale_params.json`. Le zoom ≤ 105 % s'applique à l'image agrandie ; le rythme du montage reste calé sur la taille d'origine (`native_height`).
+- GPU : le venv utilise `onnxruntime-directml` (Radeon RX 7800 XT) à la place d'`onnxruntime` (même module, jamais les deux). Détection des personnages vérifiée identique (69/69 boîtes). waifu2x donne des images fausses sous DirectML.
 - `build_capcut_draft` ne reçoit aucun profil → le format SHORT n'est pas exportable vers CapCut.
 - `batch_status.json` est un journal global unique, réécrit sans verrou.
 - PowerShell : pas de `&&`, pas de ternaire. Caractère non-ASCII dans un `print` Python → crash console cp1252.

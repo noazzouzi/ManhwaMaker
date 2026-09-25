@@ -60,119 +60,27 @@ from src.modules.analyzer import (
     parse_scene_json,
     resolve_model,
     save_analysis,
+    master_instruction,
     scrub_forbidden,
-    target_script_words,
 )
 from src.modules.slicer import load_panels, save_panels, slice_panels
 from src.utils import config as config_mod
 from tests.synthetic_strip import make_synthetic_strip
 
-_CAPTION = re.compile(r"^Panel (\d+) \(")
-_BEAT_LINE = re.compile(r"^Beat (\d+) \(panels ([\d, ]+)\)(\s*\[FILLER[^\]]*\])?:", re.MULTILINE)
-_PARAGRAPH_LINE = re.compile(r"^Paragraph (\d+) \(candidate panels: ([\d, ]*)\):", re.MULTILINE)
-
-
-# --- Outils ------------------------------------------------------------------------
-def _panel(index: int, height: int = 80, width: int = 120, kind: str = "static") -> Panel:
-    rng = np.random.default_rng(index)
-    return Panel(
-        index=index, y_start=index * 100, y_end=index * 100 + height, height=height, width=width,
-        type=kind,  # type: ignore[arg-type]
-        image=rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8),
-    )
-
-
-def _panels(n: int) -> list[Panel]:
-    return [_panel(i, height=80 + 10 * (i % 4)) for i in range(n)]
-
-
-def _jpeg_size(data: bytes) -> tuple[int, int]:
-    with Image.open(io.BytesIO(data)) as img:
-        assert img.format == "JPEG"
-        return img.size
-
-
-def make_response(payload: str | dict | list, *, prompt_tokens: int = 100, output_tokens: int = 40, thinking_tokens: int = 0):
-    """Construit une vraie ``GenerateContentResponse`` contenant ``payload`` en texte."""
-    text = payload if isinstance(payload, str) else json.dumps(payload)
-    return types.GenerateContentResponse(
-        candidates=[types.Candidate(content=types.Content(role="model", parts=[types.Part(text=text)]))],
-        usage_metadata=types.GenerateContentResponseUsageMetadata(
-            prompt_token_count=prompt_tokens, candidates_token_count=output_tokens, thoughts_token_count=thinking_tokens,
-        ),
-    )
-
-
-def all_text(contents: list[types.Part]) -> str:
-    return "\n".join(part.text for part in contents if part.text)
-
-
-def batch_ids_of(contents: list[types.Part]) -> list[int]:
-    """Numéros de cases annoncés par les libellés ``Panel N (...)`` d'un prompt."""
-    return [int(m.group(1)) for part in contents if part.text for m in [_CAPTION.match(part.text)] if m]
-
-
-def beats_payload(ids: list[int]) -> dict:
-    """Un beat par paire de cases."""
-    beats = []
-    for i in range(0, len(ids), 2):
-        group = ids[i : i + 2]
-        beats.append({"panel_ids": group, "summary": f"Beat with panels {group}.", "characters": ["Hero"], "dialogue": []})
-    return {"beats": beats}
-
-
-def script_payload(contents: list[types.Part], *, dirty: bool = False) -> dict:
-    """Un paragraphe pour deux beats narratifs, dans l'ordre."""
-    story = [int(m.group(1)) for m in _BEAT_LINE.finditer(all_text(contents)) if not m.group(3)]
-    paragraphs = []
-    for i in range(0, len(story), 2):
-        beat_ids = story[i : i + 2]
-        text = f"The hero pushes forward through beats {beat_ids}. He refuses to give up."
-        if dirty:
-            text = f"In this panel, we see the hero pushing through beats {beat_ids}. Here, he refuses to give up."
-        paragraphs.append({"text": text, "beat_ids": beat_ids, "emotion": EMOTIONS[i % len(EMOTIONS)]})
-    return {"paragraphs": paragraphs}
-
-
-def keyframes_payload(contents: list[types.Part]) -> dict:
-    """La premiere case candidate de chaque paragraphe."""
-    choices = []
-    for m in _PARAGRAPH_LINE.finditer(all_text(contents)):
-        candidates = [int(x) for x in m.group(2).split(",") if x.strip()]
-        index = int(m.group(1))
-        # Paragraphes impairs : la case cle est un impact (punch-in) ; 99 = numero invente, ignore.
-        heavy = candidates[:1] + [99] if index % 2 == 1 else []
-        choices.append({"paragraph_index": index, "key_panel_ids": candidates[:1], "action_heavy_ids": heavy})
-    return {"choices": choices}
-
-
-def default_responder(contents, call_no, config):
-    schema = config.response_schema
-    if schema is BeatBatch:
-        return make_response(beats_payload(batch_ids_of(contents)))
-    if schema is ScriptDraft:
-        return make_response(script_payload(contents), thinking_tokens=7)
-    if schema is KeyframeBatch:
-        return make_response(keyframes_payload(contents))
-    raise AssertionError(f"schema inattendu {schema}")
-
-
-class FakeModels:
-    def __init__(self, responder):
-        self.responder = responder
-        self.calls: list[dict] = []
-
-    def generate_content(self, *, model, contents, config):
-        self.calls.append({"model": model, "contents": contents, "config": config})
-        return self.responder(contents, len(self.calls), config)
-
-
-class FakeClient:
-    def __init__(self, responder=default_responder):
-        self.models = FakeModels(responder)
-
-    def calls_for(self, schema) -> list[dict]:
-        return [c for c in self.models.calls if c["config"].response_schema is schema]
+from tests.gemini_fakes import (  # faux client Gemini partage
+    FakeClient,
+    FakeModels,
+    all_text,
+    batch_ids_of,
+    beats_payload,
+    default_responder,
+    jpeg_size as _jpeg_size,
+    keyframes_payload,
+    make_response,
+    panel as _panel,
+    panels as _panels,
+    script_payload,
+)
 
 
 @pytest.fixture
@@ -243,7 +151,9 @@ def test_prompts_are_ascii_and_well_formed() -> None:
     script = analyzer.build_script_contents(beats, meta)[0].text
     assert "Beat 0 (panels 0, 1): Hero wakes. | Characters: Kang | Dialogue: \"Wait a sec\"" in script
     assert "Beat 1 (panels 2) [FILLER - do not narrate]: Title card." in script
-    assert f"about {target_script_words(beats)} words" in script and "English" in script
+    # Plus aucune cible de longueur : le prompt annonce la langue et reclame le plan.
+    assert "English" in script and "Target length" not in script
+    assert "plan_id" in script and "weight" in script
 
     group = [(0, "The hero wakes.", [0, 1]), (1, "He fights.", [2])]
     kf = analyzer.build_keyframes_contents(group, {p.index: p for p in batch}, meta)
@@ -259,20 +169,116 @@ def test_prompts_are_ascii_and_well_formed() -> None:
     for prompt in (analyzer_mod.BEATS_SYSTEM_INSTRUCTION, analyzer.script_config(beats).system_instruction,
                    analyzer.keyframes_config.system_instruction, text, header, script):
         prompt.encode("ascii")
-    assert "STRICTLY FORBIDDEN" in analyzer.script_config(beats).system_instruction
+    assert "NEVER SPEAK THE MEDIUM" in analyzer.script_config(beats).system_instruction
     assert GeminiAnalyzer(client=FakeClient()).language == "en"
 
 
-def test_target_script_words_and_paragraphs_bounds() -> None:
-    from src.modules.analyzer import target_paragraphs
+def test_master_instruction_is_formatted_in_two_passes() -> None:
+    """Le bloc INPUT porte ses propres champs : formate en une seule passe, ``{n_ids}``,
+    ``{first_id}`` et ``{last_id}`` partaient litteralement chez Gemini."""
+    from src.models.scene import CharacterCard
 
-    few = [BeatDraft(panel_ids=[i], summary="s", characters=[], dialogue=[]) for i in range(3)]
-    assert target_script_words(few) == 250 and target_paragraphs(few) == 4
-    many = [BeatDraft(panel_ids=[i, 100 + i], summary="s", characters=[], dialogue=[]) for i in range(100)]
-    assert target_script_words(many) == 1500 and target_paragraphs(many) == 40
-    # 40 beats dont 20 de remplissage, 3 cases chacun : 60 cases narratives x 11 mots, 10 paragraphes.
-    mid = [BeatDraft(panel_ids=[3 * i, 3 * i + 1, 3 * i + 2], summary="s", characters=[], dialogue=[], is_filler=(i % 2 == 0)) for i in range(40)]
-    assert target_script_words(mid) == 60 * 11 and target_paragraphs(mid) == 10
+    meta = ChapterMeta(url="u", final_url="u", series_title="Mirror World", episode_title="Ep. 3",
+                       title_no=9674, episode_no=3, image_urls=["a"])
+    cards = [CharacterCard(name="Eden", also_called=["the man who came back"], who="The hero.")]
+    for mode, unit in (("images", "124 panels"), ("beats", "124 beats")):
+        prompt = master_instruction(mode=mode, language="en", n_ids=124, first_id=0, last_id=123,
+                                    meta=meta, max_key=4, characters=cards, previous_tail="He draws the blade.")
+        prompt.encode("ascii")
+        assert re.findall(r"\{[a-z_]+\}", prompt) == []      # aucun champ oublie
+        assert unit in prompt and "numbered 0 to 123" in prompt
+        assert '"plan":{"acts"' in prompt                     # accolades du JSON exemple rendues
+        assert "Eden (also called the man who came back): The hero." in prompt
+        assert "Mirror World" in prompt and "He draws the blade." in prompt
+        assert "at most 4 ids" in prompt                      # PEAK_MAX_SPAN
+        assert "1 to 4 panel numbers" in prompt               # max_key
+    images = master_instruction(mode="images", language="en", n_ids=5, first_id=0, last_id=4)
+    beats = master_instruction(mode="beats", language="en", n_ids=5, first_id=0, last_id=4)
+    assert "MODE: IMAGES" in images and "MODE: BEATS" in beats
+    assert 'empty in every paragraph' in images and 'repeated in "beat_ids"' in beats
+
+
+def test_master_instruction_without_memory_or_mode() -> None:
+    first = master_instruction(mode="images", language="en", n_ids=3, first_id=0, last_id=2)
+    assert "first episode you narrate" in first and "first episode of the series" in first
+    assert "This chapter arrives without a title." in first
+    with pytest.raises(ValueError, match="mode inconnu"):
+        master_instruction(mode="panels", language="en", n_ids=1, first_id=0, last_id=0)
+
+
+def test_the_prompt_no_longer_asks_for_a_length() -> None:
+    """La longueur n'est plus pilotee : cinq essais mesures ont montre que Gemini ne suit pas
+    une cible de mots. Ce qui reste pilote, c'est le poids de chaque moment."""
+    prompt = master_instruction(mode="images", language="en", n_ids=40, first_id=0, last_id=39)
+    assert "Never count words, never aim at a length" in prompt
+    for banned in ("Target length", "about 440 words", "35 to 90 words", "LENGTH IS CRITICAL"):
+        assert banned not in prompt
+    assert not hasattr(analyzer_mod, "single_call_targets")
+    assert not hasattr(analyzer_mod, "target_script_words")
+    assert not hasattr(analyzer_mod, "SCRIPT_MIN_LENGTH_RATIO")
+
+
+def test_series_memory_reaches_the_prompt() -> None:
+    """La fiche des personnages et la fin du chapitre precedent doivent arriver au modele :
+    c'est tout ce qui empeche le heros de changer de nom d'un episode a l'autre."""
+    from src.models.scene import CharacterCard
+    from src.modules.analyzer import character_sheet
+
+    assert "first episode you narrate" in character_sheet([])
+    sheet = character_sheet([
+        CharacterCard(name="Eden", also_called=["the revenant", "Ed"], who="The hero."),
+        CharacterCard(name="Hugh", also_called=[], who="The rival."),
+    ])
+    assert "- Eden (also called the revenant, Ed): The hero." in sheet
+    assert "- Hugh: The rival." in sheet          # aucune parenthese vide
+
+    analyzer = GeminiAnalyzer(
+        client=FakeClient(),
+        known_characters=[CharacterCard(name="Eden", also_called=[], who="The hero.")],
+        previous_tail="He falls through the mirror.",
+    )
+    instruction = analyzer.single_call_config(_panels(6)).system_instruction
+    assert "- Eden: The hero." in instruction and "He falls through the mirror." in instruction
+    instruction.encode("ascii")
+
+
+def test_each_mode_announces_its_own_numbering() -> None:
+    """Melanger numeros de beats et numeros de cases est l'erreur la plus couteuse du plan :
+    chaque mode annonce la sienne, avec ses bornes reelles."""
+    analyzer = GeminiAnalyzer(client=FakeClient())
+    beats = [Beat(index=i, panel_ids=[2 * i, 2 * i + 1], summary="s", characters=[], dialogue=[]) for i in range(7)]
+    beats_prompt = analyzer.script_config(beats).system_instruction
+    assert "MODE: BEATS" in beats_prompt and "7 beats, numbered 0 to 6" in beats_prompt
+    assert "MODE: IMAGES" not in beats_prompt
+
+    images_prompt = analyzer.single_call_config([_panel(i) for i in range(3, 12)]).system_instruction
+    assert "MODE: IMAGES" in images_prompt and "9 panels, numbered 3 to 11" in images_prompt
+    assert "MODE: BEATS" not in images_prompt
+
+    # Chapitre vide : bornes neutres, aucun plantage (test_reliability appelle script_config([])).
+    assert "0 beats, numbered 0 to 0" in analyzer.script_config([]).system_instruction
+
+
+def test_characters_are_collected_for_the_next_chapter() -> None:
+    """La fiche rendue par le modele atterrit dans ``ChapterAnalysis`` : c'est elle qui sera
+    reinjectee au chapitre suivant."""
+    def responder(contents, call_no, config):
+        payload = recap_payload(contents)
+        payload["characters"] = [
+            {"name": "Eden", "also_called": ["the revenant"], "who": "The hero."},
+            {"name": "Hugh", "also_called": [], "who": "The rival."},
+            {"name": "eden", "also_called": [], "who": "The hero, again."},   # doublon de casse
+            {"name": "   ", "also_called": [], "who": "Sans nom."},           # ignore
+        ]
+        return make_response(payload)
+
+    analysis = GeminiAnalyzer(client=FakeClient(responder), delay_between_batches=0).analyze_panels_single_call(_panels(8))
+    assert [c.name for c in analysis.characters] == ["eden", "Hugh"]
+    assert analysis.characters[0].who == "The hero, again."     # la derniere fiche vue gagne
+
+    # Une reponse sans fiche ne fait pas echouer le chapitre.
+    plain = GeminiAnalyzer(client=FakeClient(single_call_responder), delay_between_batches=0).analyze_panels_single_call(_panels(8))
+    assert plain.characters == []
 
 
 # --- Parsing ------------------------------------------------------------------------
@@ -357,6 +363,28 @@ def test_find_and_scrub_forbidden() -> None:
     assert find_forbidden(cleaned) == []
 
 
+def test_forbidden_patterns_catch_the_narrator_talking_about_his_medium() -> None:
+    """Le prompt maitre elargit la liste : le narrateur ne parle ni de lui, ni de son support."""
+    for bad in (
+        "Our hero draws his blade.",
+        "The protagonist hesitates.",
+        "The narrator pauses.",
+        "The scene shifts to the throne room.",
+        "This chapter opens on a funeral.",
+        "The final panel leaves the throne empty.",
+    ):
+        assert find_forbidden(bad) != [], bad
+    # Garde-fou contre l'elargissement : ces phrases-la sont du recit, pas du commentaire.
+    for good in (
+        "Eden opens the last page of his father's journal.",
+        "The chapter of his life that began in the mirror ends tonight.",
+        "He shifts his weight and the blade comes free.",
+        "Hugh turns the final key and the gate gives way.",
+        "The main road is blocked.",
+    ):
+        assert find_forbidden(good) == [], good
+
+
 def test_script_conventions_hook_and_cta(caplog) -> None:
     from src.modules.analyzer import (
         CTA_TEXTS,
@@ -404,6 +432,53 @@ def test_script_conventions_hook_and_cta(caplog) -> None:
     # Intro generique seule phrase : conservee (avertissement).
     lone = enforce_script_conventions([para("Welcome back to the tower.", 0)], language="en", cta_text="")
     assert lone[0].text == "Welcome back to the tower."
+
+
+def test_a_well_placed_model_cta_is_kept() -> None:
+    """Le prompt maitre demande une formulation neuve a chaque episode.
+
+    Quand le modele obeit, sa phrase vaut mieux que la notre, identique d'un episode a l'autre :
+    on ne reprend la main que si elle est mal placee.
+    """
+    from src.modules.analyzer import CTA_TEXTS, enforce_script_conventions, split_sentences
+
+    ask = "Subscribe if you want to see how he gets out of this."
+    bodies = [
+        "The tower opens. Humanity has one hour.",
+        "The chat panics. A stranger appears.",
+        "The dragon lands. The stranger smiles.",
+        "Fire falls. He raises his hand.",
+        "He names himself. The dragon trembles.",
+    ]
+
+    def script(index: int, *, at_end: bool) -> list[ParagraphDraft]:
+        texts = list(bodies)
+        parts = split_sentences(texts[index])
+        if at_end:
+            parts.append(ask)
+        else:
+            parts.insert(1, ask)
+        texts[index] = " ".join(parts)
+        return [ParagraphDraft(text=text, beat_ids=[i], emotion="calm") for i, text in enumerate(texts)]
+
+    def canonical_used(paragraphs: list[ParagraphDraft]) -> bool:
+        out = enforce_script_conventions(paragraphs, language="en")
+        return CTA_TEXTS["en"] in " ".join(p.text for p in out)
+
+    well_placed = script(2, at_end=False)
+    assert [p.text for p in enforce_script_conventions(well_placed, language="en")] == [p.text for p in well_placed]
+    assert not canonical_used(well_placed)
+
+    assert canonical_used(script(1, at_end=False))    # dans les deux premiers paragraphes
+    assert canonical_used(script(4, at_end=False))    # dans le dernier
+    assert canonical_used(script(2, at_end=True))     # derniere phrase de son paragraphe
+    two = script(2, at_end=False)
+    two[3] = two[3].model_copy(update={"text": f"{ask} Fire falls."})
+    assert canonical_used(two)                        # deux appels : on reprend la main
+    # Un cta_text explicite reste prioritaire sur la phrase du modele.
+    forced = enforce_script_conventions(well_placed, language="en", cta_text="Like and subscribe!")
+    assert any(p.text.endswith("Like and subscribe!") for p in forced)
+    assert not any(ask in p.text for p in forced)
 
 
 def test_analyze_panels_inserts_cta_and_retries_generic_intro() -> None:
@@ -780,7 +855,7 @@ def recap_payload(contents, *, dirty: bool = False, invalid: bool = False) -> di
     """Un paragraphe pour 4 cases, la premiere case de chaque groupe en case cle."""
     ids = batch_ids_of(contents)
     paragraphs = []
-    # Paragraphes assez longs pour passer le garde-fou de longueur (SCRIPT_MIN_LENGTH_RATIO).
+    # Paragraphes fournis : la longueur n'est plus un critere, mais ils restent realistes.
     body = (
         "He steps forward through the ruined courtyard, blade low, breathing hard, while the guards "
         "scatter behind him and the old chief watches from the gate without saying a word about it."
@@ -827,20 +902,17 @@ def test_single_call_produces_the_same_shape_in_one_request() -> None:
     from src.modules.analyzer import CTA_PATTERN
 
     assert sum(1 for s in analysis.scenes if CTA_PATTERN.search(s.narration)) == 1
-    # Le prompt annonce la cible de longueur et la plage de numeros valides.
+    # Le prompt annonce la plage de numeros valides, plus aucune cible de longueur.
     prompt = all_text(client.models.calls[0]["contents"])
-    assert "Target length: about" in prompt and "numbered 0 to 23" in prompt
+    assert "numbered 0 to 23" in prompt and "Target length" not in prompt
     instruction = client.models.calls[0]["config"].system_instruction
-    assert "key_panel_ids" in instruction and "action_heavy_ids" in instruction and "HOOK" in instruction
+    assert "key_panel_ids" in instruction and "action_heavy_ids" in instruction
+    assert "MODE: IMAGES" in instruction and "24 panels, numbered 0 to 23" in instruction
 
 
-def test_single_call_targets_and_normalisation() -> None:
-    from src.modules.analyzer import normalize_recap, single_call_targets
+def test_recap_normalisation() -> None:
+    from src.modules.analyzer import normalize_recap
     from src.models.scene import RecapParagraph
-
-    words, paragraphs = single_call_targets(_panels(176))
-    assert words == 1500 and paragraphs == 25  # bornes du barème, ~1 paragraphe pour 7 cases
-    assert single_call_targets(_panels(10)) == (250, 4)  # planchers
 
     panels = _panels(10)
     drafts = [
@@ -916,44 +988,34 @@ def test_single_call_retries_on_forbidden_phrases_then_scrubs() -> None:
     assert all(find_forbidden(s.narration) == [] for s in analysis.scenes)
 
 
-def test_single_call_regenerates_a_script_that_is_too_short() -> None:
-    """Le mode une requete a tendance a trop resumer : un script trop court est redemande."""
-    from src.modules.analyzer import SCRIPT_MIN_LENGTH_RATIO, single_call_targets
+def test_a_short_script_is_no_longer_regenerated() -> None:
+    """La longueur n'est plus un critere de reprise.
 
-    assert SCRIPT_MIN_LENGTH_RATIO == 0.65
-    target, _ = single_call_targets(_panels(40))
-    state = {"calls": 0}
-
+    L'ancien garde-fou redemandait le script quand il faisait moins de 65 % de la cible. Cinq
+    essais mesures ont montre que Gemini ne suit pas une cible de mots : la reprise coutait un
+    appel entier du quota gratuit pour un resultat aussi court. Seule la qualite declenche
+    desormais une reprise.
+    """
     def responder(contents, call_no, config):
-        state["calls"] += 1
         ids = batch_ids_of(contents)
-        filler = "word " * (5 if state["calls"] == 1 else 120)  # court, puis fourni
-        paragraphs = [
-            {"text": f"The lord fights on. {filler}".strip() + ".", "emotion": "action",
-             "key_panel_ids": [ids[i]], "action_heavy_ids": []}
-            for i in range(0, min(len(ids), 8))
-        ]
-        return make_response({"paragraphs": paragraphs})
-
-    client = FakeClient(responder)
-    analysis = GeminiAnalyzer(client=client, delay_between_batches=0).analyze_panels_single_call(_panels(40))
-    assert state["calls"] == 2  # une seule reprise
-    assert analysis.script_words >= SCRIPT_MIN_LENGTH_RATIO * target
-    reminder = client.models.calls[1]["contents"][-1].text
-    assert "far too short" in reminder and str(target) in reminder
-
-    # Une reprise encore plus courte est ecartee : on garde la premiere reponse.
-    def shrinking(contents, call_no, config):
-        ids = batch_ids_of(contents)
-        filler = "word " * (30 if call_no == 1 else 2)
         return make_response({"paragraphs": [
-            {"text": f"The lord fights. {filler}".strip() + ".", "emotion": "calm",
-             "key_panel_ids": [ids[0]], "action_heavy_ids": []},
+            {"text": "The lord falls.", "emotion": "action", "key_panel_ids": [ids[i]], "action_heavy_ids": []}
+            for i in range(min(len(ids), 3))
         ]})
 
-    shrink_client = FakeClient(shrinking)
-    analysis = GeminiAnalyzer(client=shrink_client, delay_between_batches=0).analyze_panels_single_call(_panels(40))
-    assert len(shrink_client.models.calls) == 2 and analysis.script_words > 25
+    client = FakeClient(responder)
+    # cta_text="" : sans l'appel a l'abonnement canonique, le compte de mots est exact.
+    analyzer = GeminiAnalyzer(client=client, delay_between_batches=0, cta_text="")
+    analysis = analyzer.analyze_panels_single_call(_panels(40))
+    assert len(client.models.calls) == 1            # aucune reprise malgre 9 mots en tout
+    assert analysis.script_words == 9
+
+    # En revanche une formule visuelle declenche toujours la reprise.
+    dirty = FakeClient(lambda c, n, cfg: make_response(recap_payload(c, dirty=True)))
+    GeminiAnalyzer(client=dirty, delay_between_batches=0).analyze_panels_single_call(_panels(8))
+    assert len(dirty.models.calls) == 2
+    reminder = dirty.models.calls[1]["contents"][-1].text
+    assert "far too short" not in reminder and "Keep the same plan" in reminder
 
 
 def test_single_call_rejects_invalid_panel_numbers() -> None:

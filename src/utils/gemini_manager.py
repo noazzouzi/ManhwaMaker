@@ -128,9 +128,31 @@ def is_invalid_key_error(exc: BaseException) -> bool:
     return exc.code == 400 and ("api key" in text or "api_key_invalid" in text)
 
 
+#: Mots d'un 400 refusant le plafond de jetons de sortie demandé. Un modèle de la cascade
+#: peut plafonner plus bas que :data:`~src.modules.analyzer.DEFAULT_MAX_OUTPUT_TOKENS` :
+#: sans ce classement, ce 400 serait fatal et ferait perdre le chapitre entier alors que
+#: le modèle suivant l'accepterait.
+_OUTPUT_LIMIT_HINTS: tuple[str, ...] = ("max_output_tokens", "maxoutputtokens", "output token")
+
+
+def is_output_limit_error(exc: BaseException) -> bool:
+    """Vrai pour un 400 refusant le plafond de jetons de sortie demandé."""
+    if not isinstance(exc, errors.ClientError) or exc.code != 400:
+        return False
+    text = _message_of(exc).lower()
+    return any(hint in text for hint in _OUTPUT_LIMIT_HINTS)
+
+
 def is_model_unavailable_error(exc: BaseException) -> bool:
-    """Vrai pour un modèle inconnu / retiré (404 ``NOT_FOUND``)."""
-    return isinstance(exc, errors.ClientError) and exc.code == 404
+    """Vrai quand le modèle courant ne peut pas servir la requête : 404, ou 400 sur le plafond.
+
+    Les deux mènent à la même décision — passer au modèle suivant de la cascade — mais pour
+    des raisons différentes : le 404 dit que le modèle n'existe pas sur ce compte, le 400
+    qu'il n'accepte pas le plafond de jetons de sortie demandé.
+    """
+    if isinstance(exc, errors.ClientError) and exc.code == 404:
+        return True
+    return is_output_limit_error(exc)
 
 
 def is_transient_error(exc: BaseException) -> bool:
@@ -488,6 +510,7 @@ __all__ = [
     "GeminiManagerError",
     "QuotaExhaustedError",
     "ModelUnavailableError",
+    "is_output_limit_error",
     "mask_key",
     "is_daily_quota_error",
     "is_rate_limit_error",

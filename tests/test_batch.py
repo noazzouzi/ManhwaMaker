@@ -299,3 +299,96 @@ def test_run_batch_builds_manager_from_env(tmp_path, monkeypatch) -> None:
     assert list(report.results) == [url_for(1)]
     assert report.gemini["models"][0] == "gemini-3.7-flash" and report.gemini["model"] == "gemini-3.7-flash"
     assert report.gemini["keys"][0]["label"].endswith("(...0001)") and len(report.gemini["keys"]) == 2
+
+
+# --- Ordre de serie (memoire des personnages) -------------------------------------------------
+def url_for_series(title_no: int, n: int) -> str:
+    return f"https://www.webtoons.com/en/action/s{title_no}/ep-{n}/viewer?title_no={title_no}&episode_no={n}"
+
+
+def analyzed_order(tracker: Tracker) -> list[str]:
+    """Episodes analyses, dans l'ordre reel des appels."""
+    return [url.rsplit("=", 1)[1] for stage, url in tracker.calls if stage == "analyze"]
+
+
+def test_series_predecessors_chains_each_series_separately() -> None:
+    urls = [url_for_series(1, 3), url_for_series(2, 5), url_for_series(1, 1), "https://x/sans-ids"]
+    assert bp.series_predecessors(urls) == {url_for_series(1, 3): url_for_series(1, 1)}
+    assert bp.series_predecessors([]) == {}
+
+
+def test_series_order_analyses_episodes_in_ascending_order(tmp_path) -> None:
+    """La memoire de serie ne marche que dans ce sens : c'est l'episode N-1 qui ecrit la
+    fiche que le N va relire. Analyses dans le desordre, les noms ne se propagent pas."""
+    tracker = Tracker()
+    urls = [url_for(3), url_for(1), url_for(5), url_for(2), url_for(4)]
+    batch = BatchOptions(max_chapters=3, status_file=tmp_path / "s.json", out_root=tmp_path / "o")
+    report = asyncio.run(process_batch(urls, PipelineOptions(), batch, manager=make_manager(), stages=fake_stages(tracker)))
+    assert len(report.results) == 5 and not report.errors
+    assert analyzed_order(tracker) == ["1", "2", "3", "4", "5"]
+    assert tracker.peak["analyze"] == 1        # une serie s'analyse desormais en file
+    assert tracker.peak["scrape"] > 1          # mais le scraping garde son parallelisme
+
+
+def test_two_different_series_never_wait_on_each_other(tmp_path) -> None:
+    tracker = Tracker()
+    urls = [url_for_series(1, 1), url_for_series(2, 1), url_for_series(1, 2), url_for_series(2, 2)]
+    batch = BatchOptions(max_chapters=4, status_file=tmp_path / "s.json", out_root=tmp_path / "o")
+    asyncio.run(process_batch(urls, PipelineOptions(), batch, manager=make_manager(), stages=fake_stages(tracker)))
+    assert tracker.peak["analyze"] == 2        # deux series avancent en parallele
+
+
+def test_series_order_off_keeps_the_historical_parallelism(tmp_path) -> None:
+    tracker = Tracker()
+    urls = [url_for(n) for n in range(1, 5)]
+    batch = BatchOptions(max_chapters=3, series_order=False, status_file=tmp_path / "s.json", out_root=tmp_path / "o")
+    asyncio.run(process_batch(urls, PipelineOptions(), batch, manager=make_manager(), stages=fake_stages(tracker)))
+    assert tracker.peak["analyze"] == 3
+
+
+def test_series_order_never_deadlocks_on_failed_or_skipped_chapters(tmp_path) -> None:
+    """Le point d'interblocage : un chapitre qui n'analyse jamais doit quand meme liberer
+    son successeur, sinon un seul echec fige toute la serie jusqu'au delai de garde."""
+    status_file = tmp_path / "s.json"
+    status = BatchStatus(status_file)
+    status.update(url_for(2), STATUS_DONE)     # deja fait : sera ignore, sans analyse
+    tracker = Tracker()
+    urls = [url_for(n) for n in range(1, 6)]
+    batch = BatchOptions(
+        max_chapters=2, series_order_timeout_s=5.0, status_file=status_file, out_root=tmp_path / "o",
+    )
+    started = time.perf_counter()
+    report = asyncio.run(process_batch(
+        urls, PipelineOptions(), batch, manager=make_manager(),
+        stages=fake_stages(tracker, fail_analyze={url_for(3)}),
+    ))
+    elapsed = time.perf_counter() - started
+
+    assert report.skipped == [url_for(2)]
+    assert list(report.errors) == [url_for(3)]
+    # Le chapitre ignore et celui en echec n'ont bloque personne.
+    assert analyzed_order(tracker) == ["1", "3", "4", "5"]
+    assert elapsed < batch.series_order_timeout_s   # aucune attente arrivee a son terme
+
+
+def test_a_predecessor_that_never_finishes_does_not_freeze_the_batch(tmp_path) -> None:
+    """Delai de garde : passe ce point, le chapitre part sans memoire plutot que d'attendre.
+    Le prealable est de ne jamais attendre en tenant le semaphore d'analyse."""
+    tracker = Tracker()
+    stages = fake_stages(tracker)
+    slow_analyze = stages.analyze
+
+    def analyze(meta, out_dir, options, result=None, *, manager=None):
+        if meta.episode_no == 1:
+            time.sleep(0.35)                   # bien au-dela du delai de garde ci-dessous
+        return slow_analyze(meta, out_dir, options, result, manager=manager)
+
+    batch = BatchOptions(
+        max_chapters=2, series_order_timeout_s=0.1, status_file=tmp_path / "s.json", out_root=tmp_path / "o",
+    )
+    report = asyncio.run(process_batch(
+        [url_for(1), url_for(2)], PipelineOptions(), batch, manager=make_manager(),
+        stages=Stages(scrape=stages.scrape, analyze=analyze, tts=stages.tts, montage=stages.montage),
+    ))
+    assert len(report.results) == 2 and not report.errors
+    assert analyzed_order(tracker) == ["2", "1"]   # le 2 a renonce a attendre

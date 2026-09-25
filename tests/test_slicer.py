@@ -262,12 +262,12 @@ def test_slice_panels_giant_panel_tagged_scroll_vertical() -> None:
     spec = [(600, 40, "white"), (1800, 40, "white"), (500, 0, "white")]
     strip = make_synthetic_strip(spec, seed=1)
     # Sans decoupe des cases hautes : la case de 1830 px est geante (defilement).
-    panels = slice_panels(strip, split_max_height=0)
+    panels = slice_panels(strip, frame_height=0)
     assert [p.type for p in panels] == ["static", "scroll_vertical", "static"]
     assert panels[1].height == 1800 + 2 * PAD
     assert panels[1].height > GIANT_PANEL_HEIGHT
     # Seuil surchargé : tout devient géant.
-    panels_low = slice_panels(strip, giant_panel_height=400, split_max_height=0)
+    panels_low = slice_panels(strip, giant_panel_height=400, frame_height=0)
     assert all(p.type == "scroll_vertical" for p in panels_low)
     # Par defaut (1830 px > 1200) : la case est coupee en deux blocs fixes de pleine largeur.
     split = slice_panels(strip)
@@ -276,35 +276,81 @@ def test_slice_panels_giant_panel_tagged_scroll_vertical() -> None:
     assert all(p.width == 800 for p in split)
 
 
-def test_split_tall_range_blocks_and_quiet_cut_lines() -> None:
-    from src.modules.slicer import SPLIT_MAX_HEIGHT, SPLIT_MAX_PIECES, split_tall_range
+def test_split_segment_to_frame_targets_the_frame_height() -> None:
+    from src.modules.slicer import DEFAULT_FRAME_HEIGHT, frame_coverage, split_segment_to_frame
 
-    assert SPLIT_MAX_HEIGHT == 1200 and SPLIT_MAX_PIECES == 3
-    # Entiere jusqu'a 1200 px ; 2 blocs egaux au-dela ; 3 blocs au-dela de 2400 ; jamais plus de 3.
-    assert split_tall_range(0, 1200) == [(0, 1200, None)]
-    assert split_tall_range(100, 1900) == [(100, 1000, "top"), (1000, 1900, "bottom")]
-    assert split_tall_range(0, 2500) == [(0, 833, "top"), (833, 1667, "middle"), (1667, 2500, "bottom")]
-    pieces = split_tall_range(0, 5000)
-    assert [p[2] for p in pieces] == ["top", "middle", "bottom"] and pieces[-1][1] == 5000
-    assert split_tall_range(0, 3000, max_height=0) == [(0, 3000, None)]
-    assert split_tall_range(0, 3000, max_pieces=1) == [(0, 3000, None)]
-    assert split_tall_range(0, 3000, max_pieces=2) == [(0, 1500, "top"), (1500, 3000, "bottom")]
-    # Coupe guidee par la variance : la ligne la plus calme proche de la coupe ideale (fenetre +/- 15 %).
-    variance = np.full(2000, 500.0)
-    variance[1080:1090] = 0.0  # zone calme a +80 px de la coupe ideale (1000), dans la fenetre de 150 px
-    assert split_tall_range(0, 2000, variance) == [(0, 1080, "top"), (1080, 2000, "bottom")]
-    variance = np.full(2000, 500.0)
-    variance[1300] = 0.0  # hors fenetre : coupe ideale conservee
-    assert split_tall_range(0, 2000, variance) == [(0, 1000, "top"), (1000, 2000, "bottom")]
-    variance = np.full(2000, 500.0)
-    variance[900:1100] = 1.0  # plateau calme : la ligne la plus proche de l'ideal est choisie
-    assert split_tall_range(0, 2000, variance) == [(0, 1000, "top"), (1000, 2000, "bottom")]
+    def heights(y0, y1, **kw):
+        return [b - a for a, b, _ in split_segment_to_frame(y0, y1, width=800, **kw)]
+
+    # Sous le cadre l'echelle vaut deja 1 : couper ne montrerait pas un pixel de plus.
+    assert heights(0, 600) == [600]
+    assert heights(0, DEFAULT_FRAME_HEIGHT) == [DEFAULT_FRAME_HEIGHT]
+    # 1430 px : reduite a 0,76x, mais deux moities de 715 px couvriraient MOINS l'ecran.
+    assert heights(0, 1430) == [1430]
+    # Au-dela, couper gagne, et les blocs sont equilibres autour de la hauteur du cadre.
+    for total in (1830, 2500, 4000, 7391):
+        pieces = heights(0, total)
+        assert sum(pieces) == total
+        # Aucun bloc riquiqui : le plus court fait au moins la moitie du plus haut.
+        assert min(pieces) >= 0.5 * max(pieces), (total, pieces)
+        assert all(600 <= piece <= 1.6 * DEFAULT_FRAME_HEIGHT for piece in pieces), (total, pieces)
+        # La decoupe retenue occupe plus d'ecran, en moyenne, que la case entiere.
+        avg = sum(frame_coverage(piece, 800, 1920, 1080) for piece in pieces) / len(pieces)
+        assert avg > frame_coverage(total, 800, 1920, 1080)
+    # Pavage exact : les blocs sont jointifs, du debut a la fin.
+    pieces = split_segment_to_frame(100, 4100, width=800)
+    assert pieces[0][0] == 100 and pieces[-1][1] == 4100
+    assert all(pieces[i][1] == pieces[i + 1][0] for i in range(len(pieces) - 1))
+    assert [pieces[0][2], pieces[-1][2]] == ["top", "bottom"]
+    assert set(p[2] for p in pieces[1:-1]) <= {"middle"}
+    # frame_height=0 : sous-decoupe desactivee (profils qui recadrent, comme le format court).
+    assert heights(0, 7391, frame_height=0) == [7391]
+
+
+def test_split_segment_to_frame_snaps_to_a_real_border() -> None:
+    from src.modules.slicer import split_segment_to_frame
+
+    free = split_segment_to_frame(0, 1830, width=800)[0][1]
+    # Une frontiere reelle a quelques dizaines de pixels attire la coupe...
+    near = split_segment_to_frame(0, 1830, width=800, borders=[(free + 18, 1.0)])[0][1]
+    assert near == free + 18
+    # ...mais une frontiere lointaine ne la deplace pas jusqu'a desequilibrer les blocs.
+    far = split_segment_to_frame(0, 1830, width=800, borders=[(300, 1.0)])[0][1]
+    assert abs(far - free) <= 25
+
+
+def test_compute_row_change_sees_a_full_width_border() -> None:
+    from src.modules.slicer import compute_row_change, find_borders
+
+    rng = np.random.default_rng(7)
+    top = rng.integers(0, 60, size=(300, 400, 3), dtype=np.uint8)      # zone sombre
+    bottom = rng.integers(200, 256, size=(300, 400, 3), dtype=np.uint8)  # zone claire
+    change = compute_row_change(np.vstack([top, bottom]))
+    assert change.shape == (600,) and change[0] == 0.0
+    assert change[300] > 0.9          # la bordure fait changer toute la largeur
+    assert change[150] < 0.5 and change[450] < 0.5
+    assert [row for row, _ in find_borders(change, 0, 600)] == [300]
+    # Une bulle ne change qu'une partie de la largeur : pas une frontiere.
+    partial = np.vstack([top.copy(), top.copy()])
+    partial[300:, :80] = 255
+    assert find_borders(compute_row_change(partial), 0, 600) == []
+
+
+def test_compute_row_change_is_seamless_across_blocks() -> None:
+    """Le calcul est par blocs : une bordure tombant sur une jointure doit rester visible."""
+    from src.modules.slicer import _VARIANCE_BLOCK_ROWS, compute_row_change
+
+    seam = _VARIANCE_BLOCK_ROWS + 1
+    strip = np.zeros((seam + 200, 300, 3), dtype=np.uint8)
+    strip[seam:] = 255
+    change = compute_row_change(strip)
+    assert change[seam] == pytest.approx(1.0)
 
 
 def test_slice_panels_splits_tall_panels_full_width(tmp_path) -> None:
     from src.modules.slicer import load_panels
 
-    spec = [(400, 40, "white"), (1400, 40, "white"), (500, 0, "white")]  # 1430 px > 1200
+    spec = [(400, 40, "white"), (1800, 40, "white"), (500, 0, "white")]  # 1830 px > cadre
     strip = make_synthetic_strip(spec, seed=11)
     panels = slice_panels(strip)
     rgb = to_numpy_rgb(strip)
@@ -313,22 +359,25 @@ def test_slice_panels_splits_tall_panels_full_width(tmp_path) -> None:
     assert [p.source_index for p in panels] == [None, 1, 1, None]
     assert all(p.width == 800 for p in panels)  # jamais rognee en largeur
     top, bottom = panels[1], panels[2]
-    assert top.y_start == 440 - PAD and bottom.y_end == 440 + 1400 + PAD
+    assert top.y_start == 440 - PAD and bottom.y_end == 440 + 1800 + PAD
     assert top.y_end == bottom.y_start
-    assert abs(top.y_end - (top.y_start + 1430 / 2)) <= 0.15 * 715  # coupe dans la fenetre de recherche
-    assert top.height + bottom.height == 1400 + 2 * PAD
+    assert abs(top.height - bottom.height) <= 50  # blocs equilibres autour du cadre
+    assert top.height + bottom.height == 1800 + 2 * PAD
     assert np.array_equal(top.image, rgb[top.y_start : top.y_end])
     assert np.array_equal(bottom.image, rgb[bottom.y_start : bottom.y_end])
-    assert len(slice_panels(strip, split_max_height=0)) == 3
-    # Coupe sur une bande calme (6 lignes blanches, trop courtes pour etre une gouttiere).
+    assert len(slice_panels(strip, frame_height=0)) == 3
+    # Une bande calme trop courte pour etre une gouttiere reste un seul segment, coupe en deux.
     quiet = np.vstack([_noise_rgb(800, 400, seed=3), _flat_rgb(6, 400), _noise_rgb(694, 400, seed=4)])
     halves = slice_panels(quiet)
-    assert [p.part for p in halves] == ["top", "bottom"] and 800 <= halves[1].y_start <= 806
-    # Tres haute : trois blocs top / middle / bottom, largeur intacte.
-    thirds = slice_panels(_noise_rgb(4000, 800))
-    assert [p.part for p in thirds] == ["top", "middle", "bottom"]
-    assert all(p.width == 800 for p in thirds) and sum(p.height for p in thirds) == 4000
-    assert [p.source_index for p in thirds] == [0, 0, 0]
+    assert [p.part for p in halves] == ["top", "bottom"]
+    assert halves[0].y_end == halves[1].y_start and halves[1].y_end == 1500
+    # Tres haute : plus de trois blocs sont desormais permis, largeur intacte.
+    many = slice_panels(_noise_rgb(4000, 800))
+    assert len(many) > 3
+    assert [many[0].part, many[-1].part] == ["top", "bottom"]
+    assert set(p.part for p in many[1:-1]) == {"middle"}
+    assert all(p.width == 800 for p in many) and sum(p.height for p in many) == 4000
+    assert [p.source_index for p in many] == [0] * len(many)
     # Aller-retour disque : part / source_index conserves dans panels.json.
     out_dir = tmp_path / "split"
     save_panels(panels, out_dir)
@@ -339,10 +388,10 @@ def test_slice_panels_splits_tall_panels_full_width(tmp_path) -> None:
 
 
 def test_slice_panels_giant_boundary_is_strict() -> None:
-    static = slice_panels(_noise_rgb(GIANT_PANEL_HEIGHT, 64), split_max_height=0)
+    static = slice_panels(_noise_rgb(GIANT_PANEL_HEIGHT, 64), frame_height=0)
     assert len(static) == 1 and static[0].type == "static"
     assert static[0].height == GIANT_PANEL_HEIGHT
-    scroll = slice_panels(_noise_rgb(GIANT_PANEL_HEIGHT + 1, 64), split_max_height=0)
+    scroll = slice_panels(_noise_rgb(GIANT_PANEL_HEIGHT + 1, 64), frame_height=0)
     assert len(scroll) == 1 and scroll[0].type == "scroll_vertical"
 
 
@@ -377,7 +426,7 @@ def test_slice_panels_all_dropped_warning_names_min_panel_height(caplog) -> None
 def test_slice_panels_warns_when_padding_exceeds_min_gap(caplog) -> None:
     strip = np.vstack([_noise_rgb(300, 100), _flat_rgb(10, 100), _noise_rgb(300, 100, 1)])
     with caplog.at_level(logging.WARNING, logger="src.modules.slicer"):
-        panels = slice_panels(strip, min_gap=10, split_max_height=0)  # padding 15 > min_gap 10
+        panels = slice_panels(strip, min_gap=10, frame_height=0)  # padding 15 > min_gap 10
     assert len(panels) == 2
     assert "margin_padding (15) > min_gap (10)" in caplog.text
     # Valeurs par défaut (min_gap >= padding) : aucun avertissement.
@@ -432,13 +481,13 @@ def test_slice_panels_rejects_invalid_parameters() -> None:
         {"variance_threshold": -0.1},
         {"giant_panel_height": -1},
         {"min_panel_height": -1},
-        {"split_max_height": -1},
-        {"split_max_pieces": 0},
+        {"frame_height": -1},
+        {"frame_width": 0},
     ):
         with pytest.raises(ValueError):
             slice_panels(strip, **kwargs)
     # Bornes acceptées.
-    assert len(slice_panels(strip, min_gap=1, giant_panel_height=0, min_panel_height=0, split_max_height=0)) == 1
+    assert len(slice_panels(strip, min_gap=1, giant_panel_height=0, min_panel_height=0, frame_height=0)) == 1
 
 
 def test_slice_panels_margin_padding_clamped_to_image() -> None:
@@ -484,12 +533,12 @@ def test_slice_panels_drops_panels_shorter_than_min_height(caplog) -> None:
     big = _noise_rgb(300, width, seed=2)
     strip = np.vstack([gutter, tiny, gutter, big, gutter])
     with caplog.at_level(logging.DEBUG, logger="src.modules.slicer"):
-        panels = slice_panels(strip, split_max_height=0)
+        panels = slice_panels(strip, frame_height=0)
     assert len(panels) == 1
     assert (panels[0].index, panels[0].y_start, panels[0].y_end) == (0, 90, 420)
     assert "Dropped 1 panel(s) shorter than 180 px" in caplog.text
     # Seuil abaissé : la petite case est conservée et les index restent contigus.
-    kept = slice_panels(strip, min_panel_height=30, split_max_height=0)
+    kept = slice_panels(strip, min_panel_height=30, frame_height=0)
     assert [p.index for p in kept] == [0, 1]
     assert _bounds(kept) == [(35, 70), (90, 420)]
 
@@ -585,7 +634,7 @@ def test_save_panels_writes_png_and_json(tmp_path) -> None:
     # Derniere case de 200 px : en bas de bande le padding est tronque (200 + 15 >= 180 conservee).
     spec = [(200, 30, "white"), (1600, 30, "black"), (200, 0, "white")]
     strip = make_synthetic_strip(spec, seed=21)
-    panels = slice_panels(strip, split_max_height=0)
+    panels = slice_panels(strip, frame_height=0)
     out_dir = tmp_path / "panels"
     paths = save_panels(panels, out_dir)
 
@@ -678,7 +727,7 @@ def test_render_debug_overlay_tiles_narrow_tall_strips(tmp_path) -> None:
     # Bande plus étroite que DEBUG_OVERLAY_MIN_WIDTH : jamais réduite (les
     # libellés seraient illisibles), mais découpée en colonnes de max_height.
     strip = _noise_rgb(17_000, 100, seed=29)
-    panels = slice_panels(strip, split_max_height=0)
+    panels = slice_panels(strip, frame_height=0)
     assert len(panels) == 1 and panels[0].type == "scroll_vertical"
     path = render_debug_overlay(strip, panels, tmp_path / "tall.png")
     n_tiles = 3  # ceil(17000 / 8000)
@@ -693,7 +742,7 @@ def test_render_debug_overlay_keeps_min_width_for_full_chapters(tmp_path) -> Non
     spec = [(9_000, 40, "white")] * 7 + [(6_720, 0, "white")]  # 7 x 9040 + 6720
     strip = make_synthetic_strip(spec, seed=41)
     assert strip.size == (800, 70_000)
-    panels = slice_panels(strip, split_max_height=0)
+    panels = slice_panels(strip, frame_height=0)
     assert len(panels) == 8
     path = render_debug_overlay(strip, panels, tmp_path / "chapter.png")
     width, height = _png_size(path)

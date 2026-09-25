@@ -16,7 +16,9 @@ résultats dans le dossier du chapitre et est **réutilisée** si sa sortie exis
 ```
 <out_dir>/
 ├── chapter.json          métadonnées du chapitre (ChapterMeta)
-├── panels.json + panel_NNN.png + debug_overlay.png   (Module 2)
+├── panels.json + panel_NNN.png + debug_overlay.png   (Module 2 : cases de lecture, lues par l'IA)
+├── figures/ panels.json + panel_NNN.png + figures_map.json   (cases personnages)
+│   └── hd_1920x1080/ panels.json + panel_NNN.png   (personnages agrandis par IA, seuls montés)
 ├── scenes.json + scenes_report.html                  (Module 3)
 ├── audio/  scene_NNN.wav + voiceover.json + voiceover_full.wav/.mp3   (Module 4)
 ├── timeline.json                                     (Module 5)
@@ -27,6 +29,7 @@ résultats dans le dossier du chapitre et est **réutilisée** si sa sortie exis
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -39,16 +42,17 @@ from pydantic import BaseModel
 
 from src.models.audio import VoiceoverManifest
 from src.models.chapter import ChapterMeta
-from src.models.scene import ChapterAnalysis
+from src.models.scene import ChapterAnalysis, CharacterCard
 from src.models.timeline import DEFAULT_BGM_GAIN_DB, Timeline
 from src.modules.analyzer import (
     BATCH_DELAY_S,
     DEFAULT_KEYFRAME_WORKERS,
-    MAX_INLINE_PAYLOAD_BYTES,
     GeminiAnalyzer,
     load_analysis,
     save_analysis,
 )
+from src.modules.figure_panels import FIGURES_DIRNAME, FigureOptions, ensure_figures, remap_analysis
+from src.modules.upscaler import ensure_upscaled
 from src.modules.capcut_builder import (
     DEFAULT_TRANSITION_COMPENSATION,
     CapCutError,
@@ -59,6 +63,7 @@ from src.modules.capcut_builder import (
 from src.modules.preview_renderer import PreviewRenderer
 from src.modules.scraper import normalize_webtoon_url, parse_ids_from_url, scrape_chapter
 from src.modules.slicer import load_panels, render_debug_overlay, save_panels, slice_panels
+from src.modules.series_memory import load_series_context, save_chapter_sheet, series_key
 from src.modules.timeline_builder import (
     DEFAULT_CHAPTER_GAP_S,
     DEFAULT_DYNAMICS,
@@ -151,6 +156,29 @@ class PipelineOptions(BaseModel):
     #: ne redepense donc aucun quota Gemini. ``force`` recalcule tout, scraping compris.
     redo: str | None = None
     force: bool = False
+    #: Réinjecter dans l'analyse la fiche des personnages des épisodes précédents, pour que
+    #: le héros garde le même nom d'un chapitre à l'autre (:mod:`src.modules.series_memory`).
+    series_memory: bool = True
+    #: Dossier où chercher les chapitres voisins. Par défaut le dossier parent de la sortie ;
+    #: à préciser quand ``run --out`` range un chapitre hors du dossier partagé de la série.
+    series_root: str | None = None
+    #: Cases montées : ``figures`` (défaut) = uniquement les personnages détectés (zones
+    #: jaunes de toonsplit, :mod:`src.modules.figure_panels`) ; ``slicer`` = cases entières
+    #: du Smart Slicer (comportement historique). L'analyse IA lit toujours les cases entières.
+    panels: str = "figures"
+    #: Marge autour de chaque personnage (part de sa taille ; 0 = zone jaune exacte).
+    figure_margin: float = 0.0
+    #: ``cut`` : zone jaune telle quelle (bulles qui la chevauchent coupées) ; ``whole`` :
+    #: agrandie aux bulles qu'elle touche.
+    figure_bubbles: str = "cut"
+    #: Écarter les zones « personne » sans tête détectée (faux positifs : drapeau, hampe).
+    figure_require_head: bool = True
+    #: Regrouper les personnages d'une même case dans une seule image (``False`` : une image
+    #: par personnage).
+    figure_group: bool = True
+    #: Agrandir les cases personnages par IA (Real-ESRGAN anime) pour qu'elles remplissent
+    #: ~90 % du cadre (:mod:`src.modules.upscaler`) ; ``False`` = taille d'origine.
+    figure_upscale: bool = True
 
     @property
     def redo_rank(self) -> int:
@@ -161,6 +189,18 @@ class PipelineOptions(BaseModel):
         """Vrai si ``stage`` doit être recalculé plutôt que réutilisé."""
         rank = self.redo_rank
         return self.force or (rank > 0 and rank <= STAGE_RANKS[stage])
+
+    def figure_options(self) -> FigureOptions:
+        """Réglages des cases personnages."""
+        return FigureOptions(
+            margin=self.figure_margin, bubbles=self.figure_bubbles, require_head=self.figure_require_head,
+            group=self.figure_group,
+        )
+
+    def frame(self) -> tuple[int, int]:
+        """``(largeur, hauteur)`` du cadre vidéo du format choisi."""
+        framing = self.profile().framing
+        return framing.width, framing.height
 
     def profile(self):
         """Profil de format correspondant (:class:`~src.models.format_profile.FormatProfile`).
@@ -193,6 +233,8 @@ class PipelineResult:
     preview_mp4: Path | None = None
     thumbnail: Path | None = None
     n_panels: int = 0
+    #: Cases personnages montées (mode ``figures``) ; ``None`` en mode ``slicer``.
+    n_figures: int | None = None
     n_scenes: int = 0
     n_punch_in: int = 0
     n_sfx: int = 0
@@ -247,14 +289,26 @@ def stage_scrape_slice(url: str, out_dir: str | Path, options: PipelineOptions, 
     started = time.perf_counter()
     chapter_json = out_dir / "chapter.json"
     panels_json = out_dir / "panels.json"
-    if panels_json.is_file() and chapter_json.is_file() and not options.force:
+    params_json = out_dir / "slice_params.json"
+    # La sous-decoupe vise le cadre du format... mais seulement quand l'affichage est un
+    # « contain » (la case entiere, fond floute sur les cotes). Le format court recadre en
+    # 9:16 par saillance : viser une hauteur de cadre n'y veut rien dire, on desactive.
+    framing = options.profile().framing
+    slice_params = {
+        "frame_height": framing.height if framing.fit == "contain" else 0,
+        "frame_width": framing.width,
+    }
+    reusable = params_json.is_file() and json.loads(params_json.read_text(encoding="utf-8")) == slice_params
+    if panels_json.is_file() and chapter_json.is_file() and reusable and not options.force:
         meta = ChapterMeta.model_validate_json(chapter_json.read_text(encoding="utf-8"))
         n_panels = len(load_panels_meta(out_dir))
         result.reused.append("scrape+slice")
     else:
         strip, meta = scrape_chapter(url, language=None)
-        panels = slice_panels(strip)
+        panels = slice_panels(strip, **slice_params)
         save_panels(panels, out_dir)
+        # A cote de panels.json, jamais dedans : son jeu de cles est un contrat.
+        params_json.write_text(json.dumps(slice_params, indent=2), encoding="utf-8")
         render_debug_overlay(strip, panels, out_dir / "debug_overlay.png")
         n_panels = len(panels)
         del strip, panels
@@ -262,7 +316,34 @@ def stage_scrape_slice(url: str, out_dir: str | Path, options: PipelineOptions, 
     result.chapter, result.panels_json, result.n_panels = meta, panels_json, n_panels
     _timed(result, "scrape+slice", started)
     logger.info("Etape 1-2 : %d case(s) (%s)", n_panels, meta.summary())
+    if options.panels == "figures":
+        started = time.perf_counter()
+        result.n_figures = len(ensure_figures(out_dir, options.figure_options(), force=options.force))
+        _timed(result, "figures", started)
+        logger.info("Etape 1-2 : %d case(s) personnage(s) montee(s)", result.n_figures)
+        if options.figure_upscale and result.n_figures:
+            started = time.perf_counter()
+            ensure_upscaled(out_dir, options.frame(), force=options.force)
+            _timed(result, "upscale", started)
     return meta
+
+
+def _series_context(
+    meta: ChapterMeta, out_dir: Path, options: PipelineOptions
+) -> tuple[list[CharacterCard], str]:
+    """Personnages et fin de chapitre hérités des épisodes précédents de la série.
+
+    Renvoie deux valeurs vides quand la mémoire est coupée, quand la série est inconnue,
+    ou quand ``meta.episode_no`` est absent : sans numéro d'épisode, impossible de dire
+    quels chapitres précèdent celui-ci, et le chapitre risquerait de se relire lui-même.
+    """
+    if not options.series_memory:
+        return [], ""
+    if meta.episode_no is None:
+        logger.info("Memoire de serie ignoree : numero d'episode inconnu (%s)", meta.url)
+        return [], ""
+    root = Path(options.series_root) if options.series_root else out_dir.parent
+    return load_series_context(root, key=series_key(meta), before_episode=meta.episode_no)
 
 
 def stage_analyze(
@@ -284,9 +365,14 @@ def stage_analyze(
     started = time.perf_counter()
     scenes_json = out_dir / "scenes.json"
     checkpoint = out_dir / "analysis_checkpoint.json"
+    known_characters, previous_tail = _series_context(meta, out_dir, options)
     if scenes_json.is_file() and not options.recompute("analyze"):
         analysis = load_analysis(scenes_json)
         result.reused.append("analyze")
+        # Même réutilisée, l'analyse doit laisser sa fiche : un chapitre traité avant la
+        # mémoire de série resterait sinon invisible pour tous les suivants.
+        if options.series_memory:
+            save_chapter_sheet(analysis, out_dir, meta)
     else:
         if options.force and checkpoint.is_file():
             checkpoint.unlink()
@@ -295,17 +381,11 @@ def stage_analyze(
             manager=manager, model=options.model, batch_size=options.batch_size, language=options.language,
             thinking_budget=options.thinking_budget, cta_text=options.cta,
             delay_between_batches=options.gemini_batch_delay_s, keyframe_workers=options.keyframe_workers,
+            known_characters=known_characters, previous_tail=previous_tail,
         )
-        single_call = options.single_call
-        if single_call:
-            payload = analyzer.payload_bytes(panels)
-            if payload > MAX_INLINE_PAYLOAD_BYTES:
-                single_call = False
-                logger.warning(
-                    "Chapitre trop lourd pour une requete unique (%.1f Mo > %.0f Mo) : "
-                    "retour au mode en deux etapes",
-                    payload / 1_048_576, MAX_INLINE_PAYLOAD_BYTES / 1_048_576,
-                )
+        # Un chapitre trop lourd est d'abord comprime davantage : le mode deux etapes prive
+        # le redacteur des images et le reduit a reformuler des resumes deja aplatis.
+        single_call = options.single_call and analyzer.fit_for_single_call(panels)
         try:
             if single_call:
                 analysis = analyzer.analyze_panels_single_call(panels, meta)
@@ -316,6 +396,8 @@ def stage_analyze(
             result.gemini_seconds = analyzer.api_seconds  # meme en cas d'echec (quota)
         del panels
         save_analysis(analysis, scenes_json)
+        if options.series_memory:
+            save_chapter_sheet(analysis, out_dir, meta)
     result.scenes_json, result.n_scenes, result.model = scenes_json, analysis.n_scenes, analysis.model
     _timed(result, "analyze", started)
     logger.info(
@@ -394,8 +476,9 @@ def stage_montage(
         logger.info("Musique unique (%.0f dB) : %s", options.bgm_gain_db, options.bgm_file)
     else:
         logger.info("Musique de fond desactivee")
+    panels_dir, display = _montage_panels(analysis, out_dir, options, result)
     timeline = build_timeline(
-        analysis, manifest, load_panels_meta(out_dir), panels_dir=out_dir, audio_dir=audio_dir,
+        display, manifest, load_panels_meta(panels_dir), panels_dir=panels_dir, audio_dir=audio_dir,
         width=options.width, height=options.height, fps=options.fps,
         bgm_file=options.bgm_file, bgm_files=bgm_files, bgm_gain_db=options.bgm_gain_db,
         sfx_files=sfx_files, sfx_gain_db=options.sfx_gain_db,
@@ -438,6 +521,26 @@ def stage_montage(
         result.preview_mp4 = preview_path
         _timed(result, "preview", started)
     return result
+
+
+def _montage_panels(
+    analysis: ChapterAnalysis, out_dir: Path, options: PipelineOptions, result: PipelineResult
+) -> tuple[Path, ChapterAnalysis]:
+    """Dossier des cases à monter et analyse correspondante (numéros traduits en mode ``figures``).
+
+    Sans aucun personnage détecté, le chapitre est monté avec ses cases entières plutôt que
+    de produire une vidéo vide.
+    """
+    if options.panels != "figures":
+        return out_dir, analysis
+    figures_map = ensure_figures(out_dir, options.figure_options())  # déjà calculé à l'étape 1 : relu
+    result.n_figures = len(figures_map)
+    if not figures_map:
+        logger.warning("Aucun personnage detecte : montage avec les cases entieres")
+        return out_dir, analysis
+    # Agrandissement deja fait a l'etape 1 : relu du cache (calcule ici apres un --redo).
+    panels_dir = ensure_upscaled(out_dir, options.frame()) if options.figure_upscale else out_dir / FIGURES_DIRNAME
+    return panels_dir, remap_analysis(analysis, figures_map)
 
 
 def stage_thumbnail(
@@ -611,7 +714,8 @@ def format_result(result: PipelineResult) -> str:
         "=" * 72,
         f"Serie      : {(meta.series_title if meta else result.series_title) or '-'}",
         f"Episode    : {(meta.episode_title if meta else result.episode_title) or '-'}",
-        f"Cases      : {result.n_panels}   Scenes : {result.n_scenes}   Duree : {result.total_duration_s:.1f}s   Modele : {result.model or '-'}",
+        f"Cases      : {result.n_panels}" + (f" (personnages montes : {result.n_figures})" if result.n_figures is not None else "")
+        + f"   Scenes : {result.n_scenes}   Duree : {result.total_duration_s:.1f}s   Modele : {result.model or '-'}",
         f"Montage    : {result.n_punch_in} punch-in, {result.n_sfx} bruitage(s), {result.n_bgm} segment(s) musique",
         f"Dossier    : {result.out_dir}",
     ]

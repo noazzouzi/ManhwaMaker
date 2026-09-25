@@ -18,10 +18,15 @@ Algorithme :
    la première gouttière et après la dernière sont incluses) ;
 4. chaque segment est étendu de ``margin_padding`` de chaque côté (borné à
    l'image), les segments plus courts que ``min_panel_height`` sont ignorés ;
-5. une case plus haute que ``SPLIT_MAX_HEIGHT`` (1200 px) est sous-découpée
-   horizontalement en 2 ou 3 blocs de pleine largeur (``part`` = ``top`` /
-   ``middle`` / ``bottom``), la coupe étant placée sur la ligne la plus calme
-   autour de la coupe idéale ; aucune case n'est jamais rognée en largeur ;
+5. une case plus haute que le cadre vidéo est sous-découpée horizontalement en
+   blocs de pleine largeur (``part`` = ``top`` / ``middle``… / ``bottom``) dont
+   la hauteur approche celle du cadre, pour qu'ils s'affichent en résolution
+   native plutôt que réduits (``split_segment_to_frame``). Le nombre de blocs
+   n'est pas plafonné : il est choisi pour maximiser la part d'écran occupée en
+   moyenne. Les coupes sont attirées par les frontières réelles détectées
+   (``compute_row_change`` / ``find_borders``), car dans les styles où les cases
+   sont collées bord à bord il n'existe aucune ligne calme où couper ; aucune
+   case n'est jamais rognée en largeur ;
 6. chaque case est recadrée (copie) dans un ``Panel`` ; une case plus haute que
    ``giant_panel_height`` reçoit le type ``"scroll_vertical"``, sinon ``"static"``.
 
@@ -38,6 +43,7 @@ import json
 import logging
 import math
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
 import cv2
@@ -67,16 +73,36 @@ DEFAULT_MIN_PANEL_HEIGHT: int = MIN_PANEL_HEIGHT
 MERGE_SMALL_BELOW: int = 250
 #: Écart maximal (px) entre deux petites cases pour qu'elles soient fusionnées.
 MERGE_MAX_GAP: int = 150
-#: Au-delà de cette hauteur (px, padding inclus, strictement), une case est sous-découpée
-#: **horizontalement** en 2 ou 3 blocs (``top`` / ``middle`` / ``bottom``) qui gardent
-#: 100 % de la largeur d'origine ; le montage les enchaîne par un cut, sans défilement.
-SPLIT_MAX_HEIGHT: int = 1200
-#: Nombre maximal de blocs d'une case coupée.
-SPLIT_MAX_PIECES: int = 3
-#: Fenêtre de recherche de la ligne de coupe autour de la coupe idéale (fraction de la
-#: hauteur d'un bloc) : la ligne de plus faible variance y est choisie pour ne pas
-#: trancher un visage ou une bulle.
-SPLIT_SEARCH_RATIO: float = 0.15
+#: Hauteur du cadre vidéo visée par la sous-découpe. Une case affichée « contain » couvre
+#: au mieux l'écran quand sa hauteur vaut exactement celle du cadre : au-dessus elle est
+#: réduite, en dessous elle laisse du fond flouté. Mesuré sur un chapitre réel, viser le
+#: cadre au lieu d'un seuil arbitraire fait passer la part d'écran occupée par le dessin
+#: de 35,8 % à 41,6 %.
+DEFAULT_FRAME_HEIGHT: int = 1080
+DEFAULT_FRAME_WIDTH: int = 1920
+#: Hauteur maximale d'un bloc, en multiple du cadre. Au-delà, la case est forcément
+#: recoupée ; en dessous, la découpe n'est faite que si elle améliore la couverture.
+SPLIT_MAX_PIECE_RATIO: float = 1.6
+#: Pas (px) de la grille des coupes candidates : 24 px est invisible à l'écran et divise
+#: par autant le coût de la recherche.
+SPLIT_GRID_PX: int = 24
+#: Écart vertical (niveaux de gris) au-delà duquel une colonne est dite « changer » d'une
+#: ligne à la suivante.
+SPLIT_CHANGE_THRESHOLD: int = 24
+#: Fraction de la largeur devant changer d'un coup pour qu'une ligne soit une bordure de
+#: case. Une vraie bordure traverse toute la largeur ; le haut d'une bulle, non.
+SPLIT_BORDER_COVER: float = 0.50
+#: Bonus accordé à une coupe tombant sur une bordure réelle, pondéré par sa force. Gardé
+#: **strictement sous** la couverture moyenne d'un bloc : une bordure doit pouvoir
+#: *déplacer* une coupe de quelques dizaines de pixels, jamais en *créer* une.
+SPLIT_BORDER_BONUS: float = 0.04
+#: Pénalité d'un bloc plus court que le cadre, quadratique en l'écart relatif. La
+#: couverture seule est aveugle à l'équilibre : découper 1 400 px en 1 080 + 320 occupe
+#: exactement autant d'écran au total que 700 + 700, alors qu'un ruban de 320 px est bien
+#: pire à regarder. Ce terme départage, et lui seul.
+SPLIT_BALANCE_COST: float = 0.05
+#: Distance (px) au-delà de laquelle une coupe n'est plus considérée « sur » une bordure.
+SPLIT_BORDER_SNAP_PX: int = 25
 
 #: Hauteur maximale (px) d'une colonne de l'overlay de debug : au-delà, la
 #: bande est réduite puis, si besoin, découpée en colonnes côte à côte.
@@ -150,6 +176,52 @@ def compute_row_variance(strip: np.ndarray | Image.Image) -> np.ndarray:
     return row_variance
 
 
+def compute_row_change(
+    strip: np.ndarray | Image.Image, *, threshold: int = SPLIT_CHANGE_THRESHOLD
+) -> np.ndarray:
+    """Fraction des colonnes qui changent brutalement entre une ligne et la précédente.
+
+    Complément de :func:`compute_row_variance`, qui ne sait voir qu'une gouttière (zone
+    uniforme). Dans les styles où les cases sont **collées bord à bord**, il n'y a aucune
+    zone calme à trouver : la frontière est une discontinuité. Mesuré sur un chapitre
+    réel, 100 % des coupes placées par la recherche de « ligne calme » tombaient au-dessus
+    du seuil de gouttière du module lui-même — autrement dit, en plein dessin.
+
+    Une vraie bordure fait changer *toute* la largeur d'un coup ; le haut d'une bulle de
+    dialogue, seulement une partie. La fraction de colonnes qui changent sépare les deux.
+
+    Args:
+        strip: bande RGB (H, W, 3) uint8, gris (H, W) ou image PIL.
+        threshold: écart de niveau de gris à partir duquel une colonne « change ».
+
+    Returns:
+        ``np.ndarray`` float64 de forme (H,), valeurs dans [0, 1]. La première ligne vaut
+        toujours 0 (aucune ligne précédente).
+    """
+    if isinstance(strip, Image.Image):
+        strip = to_numpy_rgb(strip)
+    if not isinstance(strip, np.ndarray):
+        raise TypeError(f"compute_row_change attend une image PIL ou un np.ndarray, recu {type(strip)!r}")
+    if strip.ndim < 2:
+        raise ValueError(f"Image (H, W[, C]) attendue, recu la forme {strip.shape}")
+    height, width = strip.shape[:2]
+    if width == 0:
+        raise ValueError(f"Bande de largeur nulle : changement indefini (forme {strip.shape})")
+    if height < 2:
+        return np.zeros(height, dtype=np.float64)
+
+    gray = rgb_to_gray(strip)
+    row_change = np.zeros(height, dtype=np.float64)
+    # Blocs avec recouvrement d'UNE ligne : sans lui, la ligne de jointure n'aurait pas de
+    # predecesseur et une bordure tombant pile sur un bord de bloc serait invisible.
+    for start in range(1, height, _VARIANCE_BLOCK_ROWS):
+        stop = min(start + _VARIANCE_BLOCK_ROWS, height)
+        block = gray[start - 1 : stop].astype(np.int16)
+        delta = np.abs(np.diff(block, axis=0))
+        row_change[start:stop] = (delta > threshold).mean(axis=1)
+    return row_change
+
+
 # --- Étape 2 : détection des gouttières -----------------------------------------
 def find_gutters(
     row_variance: np.ndarray,
@@ -210,54 +282,175 @@ def _content_segments(
     return segments
 
 
-def split_tall_range(
-    y_start: int,
-    y_end: int,
-    row_variance: np.ndarray | None = None,
-    *,
-    max_height: int = SPLIT_MAX_HEIGHT,
-    max_pieces: int = SPLIT_MAX_PIECES,
-    search_ratio: float = SPLIT_SEARCH_RATIO,
-) -> list[tuple[int, int, str | None]]:
-    """Coupe une plage de lignes trop haute en 2 ou 3 blocs horizontaux de pleine largeur.
+def frame_coverage(height: int, width: int, frame_width: int, frame_height: int) -> float:
+    """Part du cadre vidéo réellement occupée par une case affichée en « contain ».
 
-    Le nombre de blocs est ``ceil(hauteur / max_height)`` borné à ``max_pieces`` ;
-    chaque coupe idéale (blocs égaux) est déplacée vers la ligne de plus faible
-    variance dans une fenêtre de ``± search_ratio × hauteur de bloc`` quand
-    ``row_variance`` est fourni (coupe dans une zone calme plutôt que dans un dessin).
+    L'affichage ne fait jamais d'agrandissement : ``echelle = min(1, cadre/case)``. La
+    couverture est donc maximale quand la case remplit exactement la hauteur du cadre, et
+    décroît **des deux côtés** : une case trop haute est réduite (et rétrécit aussi en
+    largeur), une case trop courte laisse du fond flouté au-dessus et en dessous.
+    """
+    if height <= 0 or width <= 0 or frame_width <= 0 or frame_height <= 0:
+        return 0.0
+    scale = min(1.0, frame_width / width, frame_height / height)
+    return (width * scale) * (height * scale) / float(frame_width * frame_height)
+
+
+def find_borders(
+    row_change: np.ndarray | None, y_start: int, y_end: int, *, cover: float = SPLIT_BORDER_COVER
+) -> list[tuple[int, float]]:
+    """Frontières de cases repérées dans une plage : lignes où *toute* la largeur change.
 
     Args:
-        y_start, y_end: bornes (padding inclus) de la case.
-        row_variance: variance par ligne de la bande entière (indices absolus).
-        max_height: hauteur au-delà de laquelle on coupe (0 = jamais).
-        max_pieces: nombre maximal de blocs (< 2 = jamais).
+        row_change: signal de :func:`compute_row_change` (indices absolus), ou ``None``.
+        y_start, y_end: bornes de la plage examinée.
+        cover: fraction de largeur minimale pour retenir une ligne.
 
     Returns:
-        ``[(y0, y1, part)]`` : une seule entrée ``part=None`` si la case est
-        conservée entière, sinon les blocs jointifs ``top`` / (``middle``) / ``bottom``.
+        ``[(ligne, force)]`` triées, la force valant 0,5 / 0,75 / 1,0 selon l'ampleur du
+        changement. Les lignes voisines sont regroupées : une bordure épaisse de quelques
+        pixels ne donne qu'un seul candidat, sa ligne la plus marquée.
+    """
+    if row_change is None or y_end - y_start < 2:
+        return []
+    window = np.asarray(row_change[y_start + 1 : y_end], dtype=np.float64)
+    if window.size == 0:
+        return []
+    hits = np.flatnonzero(window >= cover)
+    if hits.size == 0:
+        return []
+    borders: list[tuple[int, float]] = []
+    group = [int(hits[0])]
+    for index in hits[1:]:
+        if int(index) - group[-1] <= 20:
+            group.append(int(index))
+        else:
+            borders.append(_border_of(group, window, y_start))
+            group = [int(index)]
+    borders.append(_border_of(group, window, y_start))
+    return borders
+
+
+def _border_of(group: list[int], window: np.ndarray, y_start: int) -> tuple[int, float]:
+    peak = max(group, key=lambda i: window[i])
+    value = float(window[peak])
+    strength = 1.0 if value >= 0.70 else (0.75 if value >= 0.60 else 0.5)
+    return y_start + 1 + peak, strength
+
+
+def split_segment_to_frame(
+    y_start: int,
+    y_end: int,
+    *,
+    width: int,
+    frame_width: int = DEFAULT_FRAME_WIDTH,
+    frame_height: int = DEFAULT_FRAME_HEIGHT,
+    borders: Sequence[tuple[int, float]] = (),
+    min_piece: int = MIN_PANEL_HEIGHT,
+) -> list[tuple[int, int, str | None]]:
+    """Coupe une plage en blocs pleine largeur qui **remplissent** au mieux le cadre vidéo.
+
+    Contrairement à l'ancienne règle (« au-delà de 1200 px, 2 ou 3 blocs égaux »), le
+    nombre de blocs n'est pas plafonné et découle de la seule question qui compte : quelle
+    découpe montre le plus de dessin à l'écran. Un segment plus court que le cadre reste
+    donc entier — le couper ne ferait que rétrécir ses deux moitiés.
+
+    Les coupes candidates sont une grille de :data:`SPLIT_GRID_PX` px, enrichie des
+    frontières réelles détectées ; une coupe qui tombe sur une frontière reçoit un bonus,
+    ce qui la déplace de quelques dizaines de pixels pour éviter de trancher un dessin.
+
+    Args:
+        y_start, y_end: bornes (padding inclus) de la plage.
+        width: largeur de la bande (identique pour tous les blocs).
+        frame_width, frame_height: cadre visé. ``frame_height <= 0`` désactive la découpe.
+        borders: frontières de :func:`find_borders`.
+        min_piece: hauteur minimale d'un bloc.
+
+    Returns:
+        ``[(y0, y1, part)]`` : une entrée ``part=None`` si la plage reste entière, sinon
+        les blocs jointifs ``top`` / (``middle``…) / ``bottom``.
     """
     height = y_end - y_start
-    if max_height <= 0 or max_pieces < 2 or height <= max_height or height < 2:
-        return [(y_start, y_end, None)]
-    n_pieces = min(max_pieces, math.ceil(height / max_height))
-    block = height / n_pieces
-    cuts: list[int] = []
-    for k in range(1, n_pieces):
-        ideal = y_start + round(block * k)
-        if row_variance is not None:
-            radius = int(block * search_ratio)
-            lo = max(y_start + 1, ideal - radius, cuts[-1] + 1 if cuts else 0)
-            hi = min(y_end - 1, ideal + radius + 1)
-            if hi > lo:
-                window = np.asarray(row_variance[lo:hi], dtype=np.float64)
-                # Parmi les lignes les plus calmes (a 5 % de la plus calme), la plus proche de l'ideal.
-                tolerance = window.min() + 0.05 * max(1e-9, window.max() - window.min())
-                candidates = np.flatnonzero(window <= tolerance) + lo
-                ideal = int(candidates[np.argmin(np.abs(candidates - ideal))])
-        cuts.append(ideal)
-    bounds = [y_start, *cuts, y_end]
-    labels = ["top", "bottom"] if n_pieces == 2 else ["top", *(["middle"] * (n_pieces - 2)), "bottom"]
-    return [(bounds[i], bounds[i + 1], labels[i]) for i in range(n_pieces)]
+    whole = [(y_start, y_end, None)]
+    if frame_height <= 0 or height < 2 * min_piece:
+        return whole
+    # En dessous du cadre, l'echelle d'affichage vaut deja 1 : couper ne montre pas un
+    # pixel de plus et multiplie les plans. On ne coupe donc jamais sous cette hauteur,
+    # meme si une frontiere passe par la.
+    if height <= frame_height:
+        return whole
+    max_piece = max(min_piece, int(frame_height * SPLIT_MAX_PIECE_RATIO))
+
+    snap = {}
+    for row, strength in borders:
+        if y_start < row < y_end:
+            snap[row] = max(snap.get(row, 0.0), strength)
+    nodes = sorted({y_start, y_end, *range(y_start, y_end, SPLIT_GRID_PX), *snap})
+    bonus = [SPLIT_BORDER_BONUS * _nearest_border_strength(node, snap) for node in nodes]
+
+    # La duree de la video est fixee par la voix : plus il y a de blocs, moins chacun reste
+    # a l'ecran. Le critere est donc la couverture MOYENNE par bloc, pas la somme. Comme
+    # une moyenne ne se calcule pas par programmation dynamique, on resout a nombre de
+    # blocs FIXE (la somme, elle, se decompose bien) puis on compare les moyennes.
+    max_pieces = max(1, height // max(min_piece, 1))
+    best = [[-math.inf] * (max_pieces + 1) for _ in nodes]
+    prev = [[-1] * (max_pieces + 1) for _ in nodes]
+    best[0][0] = 0.0
+    for j in range(1, len(nodes)):
+        for i in range(j - 1, -1, -1):
+            piece = nodes[j] - nodes[i]
+            if piece < min_piece:
+                continue
+            if piece > max_piece:
+                break
+            shortfall = max(0.0, 1.0 - piece / frame_height)
+            gain = frame_coverage(piece, width, frame_width, frame_height)
+            gain -= SPLIT_BALANCE_COST * shortfall * shortfall
+            # Le bonus recompense la coupe qui OUVRE ce bloc : la borne 0 n'est pas une
+            # coupe, c'est le debut du segment.
+            gain += bonus[i] if i > 0 else 0.0
+            for count in range(max_pieces):
+                if best[i][count] == -math.inf:
+                    continue
+                score = best[i][count] + gain
+                if score > best[j][count + 1]:
+                    best[j][count + 1], prev[j][count + 1] = score, i
+
+    last = len(nodes) - 1
+    chosen = max(
+        (n for n in range(1, max_pieces + 1) if best[last][n] > -math.inf),
+        key=lambda n: best[last][n] / n,
+        default=0,
+    )
+    if chosen <= 1:
+        return whole
+
+    bounds: list[int] = []
+    node, count = last, chosen
+    while node != -1:
+        bounds.append(nodes[node])
+        node, count = prev[node][count], count - 1
+    bounds.reverse()
+    if len(bounds) <= 2:
+        return whole
+    labels = ["top", *(["middle"] * (len(bounds) - 3)), "bottom"]
+    return [(bounds[i], bounds[i + 1], labels[i]) for i in range(len(bounds) - 1)]
+
+
+def _nearest_border_strength(node: int, snap: dict[int, float]) -> float:
+    """Attraction de la frontière la plus proche de ``node``, nulle au-delà de la portée.
+
+    L'attraction **décroît avec la distance** : sans cela, tous les nœuds situés dans la
+    portée recevraient le même bonus et la coupe n'aurait aucune raison de tomber sur la
+    frontière plutôt qu'à vingt pixels de là.
+    """
+    if not snap:
+        return 0.0
+    row = min(snap, key=lambda r: abs(r - node))
+    distance = abs(row - node)
+    if distance > SPLIT_BORDER_SNAP_PX:
+        return 0.0
+    return snap[row] * (1.0 - distance / SPLIT_BORDER_SNAP_PX)
 
 
 def merge_small_segments(
@@ -304,8 +497,8 @@ def slice_panels(
     min_panel_height: int = MIN_PANEL_HEIGHT,
     merge_small_below: int = MERGE_SMALL_BELOW,
     merge_max_gap: int = MERGE_MAX_GAP,
-    split_max_height: int = SPLIT_MAX_HEIGHT,
-    split_max_pieces: int = SPLIT_MAX_PIECES,
+    frame_height: int = DEFAULT_FRAME_HEIGHT,
+    frame_width: int = DEFAULT_FRAME_WIDTH,
 ) -> list[Panel]:
     """Découpe la bande continue en cases (``Panel``) à partir de la variance des lignes.
 
@@ -322,10 +515,12 @@ def slice_panels(
         merge_small_below: les cases voisines plus basses que cette hauteur (px,
             contenu brut) sont fusionnées entre elles (0 = jamais).
         merge_max_gap: écart maximal (px) entre deux petites cases fusionnées.
-        split_max_height: une case (padding inclus) plus haute que cette valeur est
-            coupée horizontalement en 2 ou 3 blocs de pleine largeur ``top`` /
-            ``middle`` / ``bottom`` (0 = jamais) ; le montage les enchaîne par un cut.
-        split_max_pieces: nombre maximal de blocs par case coupée.
+        frame_height: hauteur (px, >= 0) du cadre vidéo visé. Une case trop haute est
+            coupée en blocs de pleine largeur ``top`` / ``middle``… / ``bottom`` dont la
+            hauteur approche celle du cadre, pour qu'ils s'affichent en résolution native
+            plutôt que réduits. ``0`` désactive complètement la sous-découpe (profils dont
+            l'affichage n'est pas un « contain », comme le format court qui recadre).
+        frame_width: largeur (px, >= 1) du cadre vidéo visé.
 
     Returns:
         Liste de ``Panel`` ordonnée de haut en bas, indices contigus à partir de 0.
@@ -347,10 +542,10 @@ def slice_panels(
         raise ValueError("min_panel_height doit etre >= 0")
     if merge_small_below < 0 or merge_max_gap < 0:
         raise ValueError("merge_small_below et merge_max_gap doivent etre >= 0")
-    if split_max_height < 0:
-        raise ValueError("split_max_height doit etre >= 0")
-    if split_max_pieces < 1:
-        raise ValueError("split_max_pieces doit etre >= 1")
+    if frame_height < 0:
+        raise ValueError("frame_height doit etre >= 0")
+    if frame_width < 1:
+        raise ValueError("frame_width doit etre >= 1")
     if margin_padding > min_gap:
         logger.warning(
             "margin_padding (%d) > min_gap (%d): neighbouring panels may overlap "
@@ -364,6 +559,8 @@ def slice_panels(
         raise ValueError(f"Bande vide : forme {rgb.shape}")
 
     row_variance = compute_row_variance(rgb)
+    # Une passe complete de plus sur la bande : inutile quand la sous-decoupe est coupee.
+    row_change = compute_row_change(rgb) if frame_height > 0 else None
     gutters = find_gutters(
         row_variance, variance_threshold=variance_threshold, min_gap=min_gap
     )
@@ -391,7 +588,10 @@ def slice_panels(
             )
             continue
 
-        pieces = split_tall_range(y_start, y_end, row_variance, max_height=split_max_height, max_pieces=split_max_pieces)
+        pieces = split_segment_to_frame(
+            y_start, y_end, width=width, frame_width=frame_width, frame_height=frame_height,
+            borders=find_borders(row_change, y_start, y_end), min_piece=min_panel_height,
+        )
         if len(pieces) > 1:
             n_split += 1
         for y0, y1, part in pieces:
@@ -415,7 +615,7 @@ def slice_panels(
             )
         kept_segments += 1
     if n_split:
-        logger.debug("%d case(s) haute(s) (> %d px) coupee(s) en 2 ou 3 blocs", n_split, split_max_height)
+        logger.debug("%d case(s) sous-decoupee(s) pour tenir dans un cadre de %d px", n_split, frame_height)
 
     if dropped:
         logger.debug("Dropped %d panel(s) shorter than %d px", dropped, min_panel_height)
@@ -744,7 +944,10 @@ __all__ = [
     "SPLIT_MAX_PIECES",
     "SPLIT_SEARCH_RATIO",
     "merge_small_segments",
-    "split_tall_range",
+    "split_segment_to_frame",
+    "find_borders",
+    "compute_row_change",
+    "frame_coverage",
     "DEBUG_OVERLAY_MAX_HEIGHT",
     "DEBUG_OVERLAY_MIN_WIDTH",
     "DEBUG_OVERLAY_TILE_GAP",

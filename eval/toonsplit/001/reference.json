@@ -1,0 +1,10 @@
+{
+ "strip": "strip.webp",
+ "note": "4 crops faits a la main ; positions mesurees par template matching sur le strip reduit a 575x8000 (voir prototype/run_proto.py), converties ici au strip natif 800x11130 (x 11130/8000).",
+ "crops": [
+  {"label": "vallee", "y0": 1091, "y1": 2119},
+  {"label": "heros_groupe", "y0": 4993, "y1": 6213},
+  {"label": "creatures", "y0": 7038, "y1": 7813},
+  {"label": "twirl", "y0": 9417, "y1": 10603}
+ ]
+}

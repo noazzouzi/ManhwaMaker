@@ -108,6 +108,54 @@ class Beat(BeatDraft):
     index: int = Field(ge=0)
 
 
+class PlanAct(BaseModel):
+    """Un des quatre actes du chapitre, borné par les identifiants qu'il couvre."""
+
+    name: str
+    first_id: int
+    last_id: int
+
+
+class PlanUnit(BaseModel):
+    """Unité du plan : ce que le spectateur regarde pendant un paragraphe.
+
+    Attributes:
+        id: rang de l'unité dans l'ordre de lecture.
+        weight: importance (1 = traversée, 2 = conséquence, 3 = décision / révélation).
+        covers: identifiants couverts (cases en mode images, beats en mode beats).
+    """
+
+    id: int
+    weight: int
+    covers: list[int]
+
+
+class ChapterPlan(BaseModel):
+    """Découpage dramatique rendu par le modèle **avant** d'écrire la prose.
+
+    Aucun champ n'a de valeur par défaut : c'est un schéma de réponse Gemini.
+    """
+
+    acts: list[PlanAct]
+    peak_id: int
+    cta_unit_index: int
+    units: list[PlanUnit]
+
+
+class CharacterCard(BaseModel):
+    """Fiche d'un personnage, à réinjecter au chapitre suivant pour figer son nom.
+
+    Attributes:
+        name: nom canonique, le seul à employer.
+        also_called: autres appellations rencontrées, à ne plus utiliser telles quelles.
+        who: qui il est, en une phrase.
+    """
+
+    name: str
+    also_called: list[str]
+    who: str
+
+
 class ParagraphDraft(BaseModel):
     """Paragraphe du script global (étape 1b, schéma de réponse Gemini).
 
@@ -115,17 +163,26 @@ class ParagraphDraft(BaseModel):
         text: texte narré (storytelling rétrospectif, sans formule visuelle).
         beat_ids: beats consécutifs couverts par le paragraphe.
         emotion: ton dominant.
+        plan_id: unité du plan dont ce paragraphe est la rédaction (-1 si absente).
+        weight: importance reprise du plan (1 à 3).
     """
 
     text: str
     beat_ids: list[int]
     emotion: Emotion
+    #: Valeurs par défaut comme ``SceneDraft.is_filler`` : le SDK les accepte dans un
+    #: schéma de réponse, et elles permettent de relire un ``analysis_checkpoint.json``
+    #: écrit avant l'arrivée du plan.
+    plan_id: int = -1
+    weight: int = 2
 
 
 class ScriptDraft(BaseModel):
-    """Réponse structurée de l'étape 1b : le script complet du chapitre."""
+    """Réponse structurée de l'étape 1b : le plan, le script, et la fiche des personnages."""
 
+    plan: ChapterPlan
     paragraphs: list[ParagraphDraft]
+    characters: list[CharacterCard]
 
 
 class RecapParagraph(BaseModel):
@@ -136,18 +193,24 @@ class RecapParagraph(BaseModel):
         emotion: émotion dominante.
         key_panel_ids: 1 à 4 cases illustrant ce paragraphe, dans l'ordre de lecture.
         action_heavy_ids: sous-ensemble montrant un impact décisif (punch-in au montage).
+        plan_id: unité du plan dont ce paragraphe est la rédaction.
+        weight: importance reprise du plan (1 à 3).
     """
 
     text: str
     emotion: str
     key_panel_ids: list[int]
     action_heavy_ids: list[int]
+    plan_id: int = -1
+    weight: int = 2
 
 
 class RecapDraft(BaseModel):
     """Schéma de réponse du mode « une requête » : tout le récap en un seul appel."""
 
+    plan: ChapterPlan
     paragraphs: list[RecapParagraph]
+    characters: list[CharacterCard]
 
 
 class KeyframeChoice(BaseModel):
@@ -197,6 +260,9 @@ class ChapterAnalysis(BaseModel):
     n_batches: int = Field(ge=0, default=0)
     scenes: list[Scene]
     beats: list[Beat] = Field(default_factory=list)
+    #: Fiche des personnages du chapitre, réinjectée au chapitre suivant pour que le
+    #: héros garde le même nom d'un épisode à l'autre.
+    characters: list[CharacterCard] = Field(default_factory=list)
     prompt_tokens: int = Field(ge=0, default=0)
     output_tokens: int = Field(ge=0, default=0)
     thinking_tokens: int = Field(ge=0, default=0)
@@ -239,6 +305,10 @@ __all__ = [
     "BeatDraft",
     "BeatBatch",
     "Beat",
+    "PlanAct",
+    "PlanUnit",
+    "ChapterPlan",
+    "CharacterCard",
     "ParagraphDraft",
     "ScriptDraft",
     "RecapParagraph",

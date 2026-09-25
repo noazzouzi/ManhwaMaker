@@ -18,6 +18,14 @@ kokoro>=0.9.4        # installe torch + misaki ; espeak-ng requis pour certaines
 soundfile>=0.12
 pydub>=0.25          # nécessite ffmpeg dans le PATH
 
+# --- Découpe intelligente (src/modules/toonsplit) + agrandissement IA des personnages (src/modules/upscaler.py) ---
+# Détecteurs têtes / personnes / bulles et Real-ESRGAN en ONNX (pas de dghs-imgutils : il impose numpy<2).
+# Windows : build DirectML (GPU DirectX 12, CPU inclus ; même module ``onnxruntime``, ne pas installer les deux).
+# Upscale d'un chapitre : ~4 s sur GPU contre ~85 s en CPU.
+onnxruntime-directml>=1.20; sys_platform == "win32"
+onnxruntime>=1.20; sys_platform != "win32"
+huggingface_hub>=0.24  # téléchargement des modèles (déjà tiré par kokoro/transformers)
+
 # --- CLI / schémas ---
 typer>=0.12
 pydantic>=2.6

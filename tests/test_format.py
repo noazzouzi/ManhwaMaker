@@ -7,6 +7,7 @@ import pytest
 
 from src.models.format_profile import CropWindow, FormatProfile
 from src.modules.format_factory import (
+    LONG_SPEED,
     SHORT_MAX_CLIP_S,
     SHORT_MAX_UPSCALE,
     VideoConfigFactory,
@@ -48,7 +49,9 @@ def test_factory_builds_both_formats_and_freezes_them() -> None:
     assert long_p.framing.fit == "contain" and long_p.framing.max_upscale == 1.05
     assert long_p.pacing.min_clip_s == 2.5 and long_p.pacing.max_clip_s is None
     assert long_p.subtitles.max_words == 4 and long_p.subtitles.stroke_px == 2
-    assert long_p.audio.speed == 1.0 and not long_p.outro.enabled
+    # Seule derogation aux reglages historiques : la voix est acceleree de 15 %, a la
+    # demande. Kokoro parle plus vite a la synthese, la hauteur de voix ne monte pas.
+    assert long_p.audio.speed == LONG_SPEED == 1.15 and not long_p.outro.enabled
     # Le format court applique la specification.
     assert (short_p.framing.width, short_p.framing.height) == (1080, 1920)
     assert short_p.framing.fit == "cover_crop" and short_p.framing.saliency_crop
@@ -238,3 +241,22 @@ def test_expand_panel_ids_gives_the_short_format_more_material() -> None:
     # Une scene sans case reste vide, et rien n'est invente hors des cases existantes.
     assert expand_panel_ids([[], [3]], [3, 4]) == [[], [3, 4]]
     assert expand_panel_ids([[0]], []) == [[0]]
+
+
+def test_both_profiles_expand_to_unused_panels() -> None:
+    """Le garde-fou : oublier le drapeau sur un profil ferait regresser ce format en silence."""
+    for name in VideoConfigFactory.available():
+        assert VideoConfigFactory.create(name).pacing.expand_to_unused_panels is True, name
+
+
+def test_long_expands_without_inheriting_short_pacing() -> None:
+    """L'elargissement et la cadence sont deux reglages distincts : le long garde son plancher."""
+    long_p = VideoConfigFactory.create("LONG")
+    assert long_p.pacing.expand_to_unused_panels is True
+    assert long_p.pacing.max_clip_s is None          # pas de subdivision facon format court
+    assert long_p.pacing.min_clip_s == 2.5           # plancher historique intact
+    assert long_p.pacing.max_subshots_per_panel == 1  # aucun re-cadrage
+
+
+def test_expansion_can_be_switched_off_by_profile() -> None:
+    assert VideoConfigFactory.create("LONG", pacing={"expand_to_unused_panels": False}).pacing.expand_to_unused_panels is False

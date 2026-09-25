@@ -7,8 +7,10 @@ from pathlib import Path
 import pytest
 
 from src.models.audio import SceneAudio, VoiceoverManifest
+from src.models.format_profile import PacingRules
 from src.models.scene import ChapterAnalysis, Scene
 from src.models.timeline import PanelClip
+from src.modules.format_factory import VideoConfigFactory
 from src.modules.timeline_builder import (
     DEFAULT_BGM_CROSSFADE_S,
     DEFAULT_BGM_GAIN_DB,
@@ -77,11 +79,13 @@ def test_build_timeline_durations_follow_audio_and_panel_weights(tmp_path) -> No
     assert timeline.series_title == "S" and timeline.total_duration_s == pytest.approx(8.6)
     assert [c.panel_index for c in timeline.clips] == [0, 1, 3]  # la scene filler (case 2) n'est pas montee
     first, second, third = timeline.clips
-    weight_1 = max(60, DEFAULT_MIN_PANEL_WEIGHT)
-    # 2 cases pour 5.3 s : 2.5 s minimum chacune, le reste (0.3 s) au prorata des poids.
-    remainder = 5.3 - 2 * DEFAULT_MIN_CLIP_S
-    assert first.duration_s == pytest.approx(DEFAULT_MIN_CLIP_S + remainder * 1000 / (1000 + weight_1))
-    assert second.duration_s == pytest.approx(DEFAULT_MIN_CLIP_S + remainder * weight_1 / (1000 + weight_1))
+    # 2 cases pour 5.3 s, partagees au prorata des poids et non a parts egales : la grande
+    # case (1000 px) reste bien plus longtemps que la petite (60 px, ramenee au plancher de
+    # poids). Un partage uniforme donnerait 2.65 s chacune, c'est-a-dire le metronome.
+    assert first.duration_s == pytest.approx(3.70)
+    assert second.duration_s == pytest.approx(1.60)
+    assert first.duration_s > 2 * second.duration_s
+    assert second.duration_s >= PacingRules().emphasis_floor_s - 1e-9
     assert second.start_s == pytest.approx(first.end_s)
     assert second.end_s == pytest.approx(5.3)  # la derniere case absorbe l'arrondi
     assert third.start_s == pytest.approx(5.3) and third.duration_s == pytest.approx(3.3)
@@ -99,6 +103,73 @@ def test_build_timeline_durations_follow_audio_and_panel_weights(tmp_path) -> No
     assert timeline.subtitles[-1].text == "Fight!" and timeline.subtitles[-1].start_s == pytest.approx(5.3)
     assert timeline.n_scenes == 2
     assert timeline.sfx == [] and timeline.bgm == []  # aucun fichier audio fourni
+
+
+def test_the_impact_panel_gets_more_screen_time(tmp_path) -> None:
+    """Le defaut que ce test protege : un coup decisif et un plan de dialogue avaient
+    exactement le meme temps d'ecran. Mesure sur un vrai chapitre avant correction : les
+    78 cases tenaient toutes entre 2.57 s et 2.89 s, soit un metronome.
+
+    ``action_heavy_ids`` est le seul signal disant *ce moment compte*, et il ne servait
+    qu'a choisir le mouvement de camera, jamais le partage du temps.
+    """
+    meta = [
+        {"index": i, "file": f"panel_{i:03d}.png", "width": 720, "height": 800,
+         "type": "static", "y_start": 800 * i, "y_end": 800 * (i + 1)}
+        for i in range(4)
+    ]
+
+    def timeline_for(heavy: list[int]):
+        analysis = ChapterAnalysis(
+            model="fake", language="en", n_panels=4,
+            scenes=[Scene(index=0, panel_ids=[0, 1, 2, 3], narration="Quatre cases.",
+                          emotion="action", action_heavy_ids=heavy)],
+        )
+        manifest = VoiceoverManifest(
+            language="en", lang_code="a", voice="v", speed=1.0, padding_s=0.3, sample_rate=24000,
+            items=[SceneAudio(scene_index=0, file="s.wav", duration_s=12.0, speech_s=11.5,
+                              sample_rate=24000, text="t")],
+            total_duration_s=12.0,
+        )
+        return build_timeline(analysis, manifest, meta, panels_dir=tmp_path, audio_dir=tmp_path)
+
+    marque = timeline_for([2])
+    durees = [c.duration_s for c in marque.clips]
+    assert durees == pytest.approx([2.4, 2.4, 4.8, 2.4])
+    assert durees[2] == pytest.approx(2 * durees[0])          # exactement heavy_emphasis
+    assert marque.clips[2].motion == "punch_in"
+    # L'image ne doit jamais glisser par rapport a la voix.
+    assert sum(durees) == pytest.approx(12.0)
+    assert marque.total_duration_s == pytest.approx(12.0)
+
+    # Rien de marque et des cases de meme hauteur : aucune variation inventee.
+    neutre = timeline_for([])
+    assert [c.duration_s for c in neutre.clips] == pytest.approx([3.0] * 4)
+    assert sum(c.duration_s for c in neutre.clips) == pytest.approx(12.0)
+
+
+def test_a_panel_taller_than_the_frame_is_held_longer(tmp_path) -> None:
+    """Une case plus haute que le cadre est affichee en entier, donc plus petite a l'ecran :
+    il faut plus de temps pour la parcourir."""
+    meta = [
+        {"index": 0, "file": "panel_000.png", "width": 720, "height": 900,
+         "type": "static", "y_start": 0, "y_end": 900},
+        {"index": 1, "file": "panel_001.png", "width": 720, "height": 1600,
+         "type": "static", "y_start": 900, "y_end": 2500},
+    ]
+    analysis = ChapterAnalysis(
+        model="fake", language="en", n_panels=2,
+        scenes=[Scene(index=0, panel_ids=[0, 1], narration="Deux cases.", emotion="calm")],
+    )
+    manifest = VoiceoverManifest(
+        language="en", lang_code="a", voice="v", speed=1.0, padding_s=0.3, sample_rate=24000,
+        items=[SceneAudio(scene_index=0, file="s.wav", duration_s=10.0, speech_s=9.5,
+                          sample_rate=24000, text="t")],
+        total_duration_s=10.0,
+    )
+    clips = build_timeline(analysis, manifest, meta, panels_dir=tmp_path, audio_dir=tmp_path).clips
+    assert clips[1].duration_s > clips[0].duration_s
+    assert sum(c.duration_s for c in clips) == pytest.approx(10.0)
 
 
 def test_build_timeline_truncates_to_max_duration(tmp_path) -> None:
@@ -254,7 +325,9 @@ def test_build_timeline_applies_min_clip_duration(tmp_path) -> None:
     timeline = build_timeline(analysis, manifest, PANELS_META, panels_dir=tmp_path, audio_dir=tmp_path)
     # 5.3 s / 2.5 s -> 2 cases : les plus grandes (3 = 3000 px, 0 = 1000 px), dans l'ordre de lecture.
     assert [c.panel_index for c in timeline.clips] == [0, 3]
-    assert all(c.duration_s >= DEFAULT_MIN_CLIP_S for c in timeline.clips)
+    # min_clip_s fixe le NOMBRE de cases (2 ici) ; la duree de chacune vient ensuite du
+    # partage pondere, dont le seul plancher est emphasis_floor_s.
+    assert all(c.duration_s >= PacingRules().emphasis_floor_s - 1e-9 for c in timeline.clips)
     assert timeline.total_duration_s == pytest.approx(5.3)
     with pytest.raises(ValueError):
         build_timeline(analysis, manifest, PANELS_META, panels_dir=tmp_path, audio_dir=tmp_path, min_clip_s=-1)
@@ -388,7 +461,9 @@ def test_build_timeline_wires_dynamics_and_reports_possible_drift(tmp_path) -> N
     # Une seule frontiere de scene (calm -> action), donc une seule transition.
     assert timeline.n_transitions == 1
     assert [c.transition is not None for c in timeline.clips] == [False, True, False]
-    assert timeline.transition_drift_s == pytest.approx(0.30)
+    # La transition est plafonnee a 15 % de la plus courte des deux cases qu'elle relie :
+    # elle suit donc le nouveau partage du temps.
+    assert timeline.transition_drift_s == pytest.approx(0.24)
     # La scene action recoit un effet superpose, la scene calme non.
     assert [(c.scene_index, c.kind) for c in timeline.vfx] == [(2, "speed_lines")]
     # Les sous-titres sont animes selon l'emotion de leur scene.
@@ -421,3 +496,73 @@ def test_concat_drops_the_last_transition_and_carries_vfx(tmp_path) -> None:
     # Les numeros de scene des effets suivent le meme decalage que les clips.
     assert merged.vfx[-1].scene_index != second.vfx[-1].scene_index
     assert merged.subtitles[0].animation == first.subtitles[0].animation
+
+
+def _analysis_with_unused_panels() -> ChapterAnalysis:
+    """Deux scenes, cases cles 0 et 3 : les cases 1 et 2 sont libres et non filler."""
+    return ChapterAnalysis(
+        series_title="S", episode_title="E", model="fake", language="en", n_panels=4,
+        scenes=[
+            Scene(index=0, panel_ids=[0], emotion="calm",
+                  narration="The hero wakes up alone in the ruined city and starts to walk north."),
+            Scene(index=1, panel_ids=[3], emotion="action", narration="Fight!"),
+        ],
+    )
+
+
+def _manifest_with_room() -> VoiceoverManifest:
+    """9 s sur la premiere scene : de quoi tenir trois cases au plancher de 2,5 s."""
+    return VoiceoverManifest(
+        language="en", lang_code="a", voice="am_puck", speed=1.0, padding_s=0.3, sample_rate=24000,
+        items=[
+            SceneAudio(scene_index=0, file="scene_000.wav", duration_s=9.0, speech_s=8.7, sample_rate=24000, text="..."),
+            SceneAudio(scene_index=1, file="scene_001.wav", duration_s=3.3, speech_s=3.0, sample_rate=24000, text="Fight!"),
+        ],
+        total_duration_s=12.3,
+    )
+
+
+def test_long_timeline_shows_the_panels_left_out_by_the_analysis(tmp_path) -> None:
+    """En format long, une scene s'etend aux cases non retenues qui la suivent."""
+    timeline = build_timeline(
+        _analysis_with_unused_panels(), _manifest_with_room(), PANELS_META,
+        panels_dir=tmp_path, audio_dir=tmp_path / "audio",
+    )
+    assert [c.panel_index for c in timeline.clips] == [0, 1, 2, 3]
+    # Sans elargissement, seules les deux cases cles seraient montees.
+    sober = build_timeline(
+        _analysis_with_unused_panels(), _manifest_with_room(), PANELS_META,
+        panels_dir=tmp_path, audio_dir=tmp_path / "audio",
+        profile=VideoConfigFactory.create("LONG", pacing={"expand_to_unused_panels": False}),
+    )
+    assert [c.panel_index for c in sober.clips] == [0, 3]
+    # La voix reste le maitre du temps : elargir ne change pas la duree de la video.
+    assert timeline.total_duration_s == pytest.approx(sober.total_duration_s)
+
+
+def test_long_widening_never_shows_a_filler_scene_panel(tmp_path) -> None:
+    """La case 2 appartient a la scene filler : l'elargissement ne doit pas la repecher."""
+    timeline = build_timeline(
+        _analysis(), _manifest(), PANELS_META, panels_dir=tmp_path, audio_dir=tmp_path / "audio",
+    )
+    assert 2 not in [c.panel_index for c in timeline.clips]
+
+
+def test_long_widening_keeps_native_resolution_and_capped_zoom(tmp_path) -> None:
+    """Les regles dures tiennent sur les cases repechees : pas de rognage, zoom <= 1,05."""
+    timeline = build_timeline(
+        _analysis_with_unused_panels(), _manifest_with_room(), PANELS_META,
+        panels_dir=tmp_path, audio_dir=tmp_path / "audio",
+    )
+    by_index = {m["index"]: m for m in PANELS_META}
+    for clip in timeline.clips:
+        meta = by_index[clip.panel_index]
+        # La fenetre couvre la case entiere : aucun pixel rogne, ni en largeur ni en hauteur.
+        assert clip.crop is not None and clip.crop.fit == "contain"
+        assert (clip.crop.x, clip.crop.y) == (0, 0)
+        assert (clip.crop.width, clip.crop.height) == (meta["width"], meta["height"])
+    # Le zoom n'est pas porte par le clip : il decoule du mouvement, plafonne a MAX_ZOOM.
+    # En long, seul ken_burns est autorise, et son amplitude tient dans le plafond.
+    assert {c.motion for c in timeline.clips} == {"ken_burns"}
+    assert 1.0 + KEN_BURNS_ZOOM <= MAX_ZOOM + 1e-9
+    assert all(c.duration_s >= PacingRules().emphasis_floor_s - 1e-9 for c in timeline.clips)
