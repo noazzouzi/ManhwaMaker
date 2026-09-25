@@ -51,6 +51,11 @@ SHORT_MAX_CLIP_S: float = 1.2
 SHORT_SPEED: float = 1.20
 #: Silence interne toléré avant rognage.
 SHORT_MAX_SILENCE_S: float = 0.1
+#: Accélération de la voix en format long. Même mécanisme que :data:`SHORT_SPEED` : Kokoro
+#: parle plus vite à la synthèse, la hauteur de voix ne monte donc pas. Elle raccourcit
+#: mécaniquement la vidéo, puisque la durée de chaque paragraphe suit sa narration.
+#: ``--speed`` sur la ligne de commande continue de primer.
+LONG_SPEED: float = 1.15
 
 #: Polices d'affichage du mode SHORT, de la plus grasse à la plus sûre. Futura est une
 #: police commerciale, absente de la machine : Montserrat Black (graisse 900, licence
@@ -73,14 +78,21 @@ WHITE: tuple[int, int, int] = (255, 255, 255)
 
 
 def _long_profile() -> FormatProfile:
-    """Mode long : comportement historique, strictement inchangé."""
+    """Mode long : comportement historique, à la vitesse de voix près.
+
+    Seule dérogation : :data:`LONG_SPEED`. Tout le reste - cadrage, cadence, zoom,
+    sous-titres - garde son réglage d'origine.
+    """
     return FormatProfile(
         name="LONG",
         framing=FramingRules(
             width=1920, height=1080, fps=60, fit="contain",
             saliency_crop=False, background_blur=True, max_upscale=1.05,
         ),
-        pacing=PacingRules(min_clip_s=2.5, max_clip_s=None, max_subshots_per_panel=1),
+        pacing=PacingRules(
+            min_clip_s=2.5, max_clip_s=None, max_subshots_per_panel=1,
+            expand_to_unused_panels=True,
+        ),
         motion=MotionRules(
             motions=("ken_burns",), punch_in_zoom=0.05, punch_in_s=0.2, ken_burns_zoom=0.05,
         ),
@@ -89,7 +101,7 @@ def _long_profile() -> FormatProfile:
             # 0,9222 = (1080 - 84) / 1080 : reproduit au pixel la marge basse historique.
             fill=WHITE, highlight_color=None, highlight_current_word=False, vertical_anchor=0.92222,
         ),
-        audio=AudioRules(speed=1.0, sentence_gap_s=0.2, padding_s=0.18, max_internal_silence_s=None),
+        audio=AudioRules(speed=LONG_SPEED, sentence_gap_s=0.2, padding_s=0.18, max_internal_silence_s=None),
         outro=OutroRules(enabled=False),
     )
 
@@ -104,6 +116,7 @@ def _short_profile() -> FormatProfile:
         ),
         pacing=PacingRules(
             min_clip_s=None, max_clip_s=SHORT_MAX_CLIP_S, max_subshots_per_panel=6, min_shot_s=0.45,
+            expand_to_unused_panels=True,
         ),
         motion=MotionRules(
             motions=("punch_in", "fast_pan"), punch_in_zoom=SHORT_PUNCH_IN_ZOOM, punch_in_s=0.12,
@@ -190,6 +203,7 @@ __all__ = [
     "SHORT_PUNCH_IN_ZOOM",
     "SHORT_MAX_CLIP_S",
     "SHORT_SPEED",
+    "LONG_SPEED",
     "SHORT_FONTS",
     "LONG_FONTS",
     "VideoConfigFactory",

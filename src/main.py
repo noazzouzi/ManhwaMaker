@@ -52,9 +52,11 @@ def _pipeline_options(
     project_name, bgm, bgm_dir, no_bgm, sfx_dir, no_sfx, cta, no_cta, fps, force, redo=None,
     sentence_gap=None, padding=None, batch_size=None, gemini_batch_delay=None, keyframe_workers=None,
     multi_call=False, dynamics=None, transition_compensation=None, thumbnail=False, thumbnail_backend=None,
-    video_format=None,
+    video_format=None, no_series_memory=False, panels="figures", figure_margin=0.0, figure_bubbles="cut",
+    figures_separate=False, no_upscale=False,
 ) -> PipelineOptions:
-    overrides = {}
+    overrides = {"panels": panels, "figure_margin": figure_margin, "figure_bubbles": figure_bubbles,
+                 "figure_group": not figures_separate, "figure_upscale": not no_upscale}
     if video_format is not None:
         overrides["video_format"] = str(video_format).upper()
     if dynamics is not None:
@@ -79,6 +81,7 @@ def _pipeline_options(
     if keyframe_workers is not None:
         overrides["keyframe_workers"] = keyframe_workers
     overrides["single_call"] = not multi_call
+    overrides["series_memory"] = not no_series_memory
     return PipelineOptions(
         language=language, voice=voice, speed=speed, model=model, thinking_budget=thinking_budget,
         preview_seconds=preview_seconds if preview_seconds > 0 else None, make_preview=not no_preview,
@@ -123,6 +126,12 @@ def run(
     fps: Annotated[int, typer.Option("--fps", help="Images par seconde.")] = 60,
     max_gemini_rpm: Annotated[int, typer.Option("--max-gemini-rpm", help="Requetes Gemini par minute (toutes cles).")] = 10,
     force: Annotated[bool, typer.Option("--force", help="Recalculer toutes les etapes.")] = False,
+    no_series_memory: Annotated[bool, typer.Option("--no-series-memory", help="Ne pas reutiliser la fiche des personnages des episodes precedents.")] = False,
+    panels: Annotated[str, typer.Option("--panels", help="Cases montees : figures (defaut, personnages detectes seuls) ou slicer (cases entieres).")] = "figures",
+    figure_margin: Annotated[float, typer.Option("--figure-margin", help="Marge autour des personnages (part de leur taille, defaut 0).")] = 0.0,
+    figure_bubbles: Annotated[str, typer.Option("--figure-bubbles", help="cut (defaut : zone jaune exacte) ou whole (agrandie aux bulles touchees).")] = "cut",
+    figures_separate: Annotated[bool, typer.Option("--figures-separate", help="Une image par personnage au lieu d'une image par case (personnages d'une meme case regroupes par defaut).")] = False,
+    no_upscale: Annotated[bool, typer.Option("--no-upscale", help="Garder les personnages a leur taille d'origine (defaut : agrandis par IA a ~90 % du cadre).")] = False,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Logs DEBUG.")] = False,
 ) -> None:
     """Enchaine scraping, decoupe, analyse Gemini, voix off Kokoro, brouillon CapCut et apercu."""
@@ -138,6 +147,8 @@ def run(
         gemini_batch_delay=gemini_batch_delay, keyframe_workers=keyframe_workers, multi_call=multi_call,
         dynamics=dynamics, transition_compensation=transition_compensation,
         thumbnail=thumbnail, thumbnail_backend=thumbnail_backend, video_format=video_format,
+        no_series_memory=no_series_memory, panels=panels, figure_margin=figure_margin, figure_bubbles=figure_bubbles,
+        figures_separate=figures_separate, no_upscale=no_upscale,
     )
     try:
         manager = GeminiManager(preferred_model=model, max_rpm=max_gemini_rpm)
@@ -167,6 +178,7 @@ def batch(
     out_root: Annotated[Optional[Path], typer.Option("--out-root", help="Dossier racine des sorties (defaut output/).")] = None,
     no_retry_failed: Annotated[bool, typer.Option("--no-retry-failed", help="Ne pas reprendre les chapitres en echec.")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Lister les chapitres cibles sans rien traiter.")] = False,
+    no_series_order: Annotated[bool, typer.Option("--no-series-order", help="Analyser les episodes d'une serie en parallele plutot que dans l'ordre (plus rapide, mais le chapitre N n'herite plus des noms du N-1).")] = False,
     language: Annotated[str, typer.Option("--language", help="Langue de la narration et de la voix.")] = DEFAULT_NARRATION_LANGUAGE,
     voice: Annotated[Optional[str], typer.Option("--voice", help="Voix Kokoro (defaut am_puck en anglais ; voir la commande voices).")] = None,
     speed: Annotated[float, typer.Option("--speed", help="Vitesse de la voix.")] = 1.0,
@@ -197,6 +209,12 @@ def batch(
     fps: Annotated[int, typer.Option("--fps", help="Images par seconde.")] = 60,
     redo: Annotated[Optional[str], typer.Option("--redo", help="Recalculer a partir de cette etape : analyze, tts ou montage (les precedentes sont reutilisees, donc aucun quota Gemini pour --redo tts).")] = None,
     force: Annotated[bool, typer.Option("--force", help="Recalculer toutes les etapes, chapitres deja faits compris.")] = False,
+    no_series_memory: Annotated[bool, typer.Option("--no-series-memory", help="Ne pas reutiliser la fiche des personnages des episodes precedents.")] = False,
+    panels: Annotated[str, typer.Option("--panels", help="Cases montees : figures (defaut, personnages detectes seuls) ou slicer (cases entieres).")] = "figures",
+    figure_margin: Annotated[float, typer.Option("--figure-margin", help="Marge autour des personnages (part de leur taille, defaut 0).")] = 0.0,
+    figure_bubbles: Annotated[str, typer.Option("--figure-bubbles", help="cut (defaut : zone jaune exacte) ou whole (agrandie aux bulles touchees).")] = "cut",
+    figures_separate: Annotated[bool, typer.Option("--figures-separate", help="Une image par personnage au lieu d'une image par case (personnages d'une meme case regroupes par defaut).")] = False,
+    no_upscale: Annotated[bool, typer.Option("--no-upscale", help="Garder les personnages a leur taille d'origine (defaut : agrandis par IA a ~90 % du cadre).")] = False,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Logs DEBUG.")] = False,
 ) -> None:
     """Traite une serie (plage d'episodes ou liste d'URL) en parallele, avec suivi batch_status.json."""
@@ -228,10 +246,13 @@ def batch(
         gemini_batch_delay=gemini_batch_delay, keyframe_workers=keyframe_workers, multi_call=multi_call,
         dynamics=dynamics, transition_compensation=transition_compensation,
         thumbnail=thumbnail, thumbnail_backend=thumbnail_backend, video_format=video_format,
+        no_series_memory=no_series_memory, panels=panels, figure_margin=figure_margin, figure_bubbles=figure_bubbles,
+        figures_separate=figures_separate, no_upscale=no_upscale,
     )
     batch_options = BatchOptions(
         max_chapters=max_chapters, max_gemini_rpm=max_gemini_rpm, max_tts_workers=max_tts_workers,
         max_render_workers=max_render_workers, max_scrape_workers=max_scrape_workers, retry_failed=not no_retry_failed,
+        series_order=not no_series_order,
         **({"status_file": status_file} if status_file else {}), **({"out_root": out_root} if out_root else {}),
     )
     try:

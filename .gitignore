@@ -16,3 +16,6 @@ __pycache__/
 batch_status.json
 batch_status.json.tmp
 
+
+# Modeles ONNX exportes localement (toonsplit)
+models/

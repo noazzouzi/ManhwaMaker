@@ -20,6 +20,7 @@ from pydantic import ValidationError
 
 from src.models.scene import ChapterAnalysis
 from src.models.thumbnail import MAX_HOOK_CHARS, MAX_HOOK_WORDS, ThumbnailBrief, ThumbnailDraft
+from src.modules.analyzer import DEFAULT_MAX_OUTPUT_TOKENS as _DEFAULT_MAX_OUTPUT_TOKENS
 from src.utils.gemini_manager import GeminiManager
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,9 @@ logger = logging.getLogger(__name__)
 #: Température : un peu plus haute que l'analyse du chapitre, l'accroche gagnant à être vive.
 DEFAULT_TEMPERATURE: float = 0.7
 DEFAULT_TIMEOUT_MS: int = 60_000
+#: Plafond de jetons de sortie, repris de l'analyzer de chapitre : sans lui, une réponse
+#: coupée ressort en « JSON invalide » alors que ``finish_reason`` annonce ``STOP``.
+DEFAULT_MAX_OUTPUT_TOKENS: int = _DEFAULT_MAX_OUTPUT_TOKENS
 #: Nombre de paragraphes du script envoyés en contexte (début + fin : l'accroche et le
 #: cliffhanger sont les deux endroits où se trouve le contraste le plus fort).
 CONTEXT_PARAGRAPHS: int = 6
@@ -179,6 +183,7 @@ class ThumbnailAnalyzer:
             temperature=self.temperature,
             response_mime_type="application/json",
             response_schema=ThumbnailDraft,
+            max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
             http_options=types.HttpOptions(timeout=DEFAULT_TIMEOUT_MS),
         )
 

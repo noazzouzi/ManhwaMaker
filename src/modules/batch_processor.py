@@ -83,6 +83,15 @@ class BatchOptions:
     status_file: Path = DEFAULT_STATUS_FILE
     out_root: Path = DEFAULT_OUT_ROOT
     retry_failed: bool = True
+    #: Analyser les épisodes d'une même série dans l'ordre croissant : le chapitre N attend
+    #: que le N-1 ait écrit sa fiche de personnages, sinon il l'analyserait sans mémoire.
+    #: **C'est le seul vrai coût de la mémoire de série** : l'analyse d'une série n'est plus
+    #: parallèle. Le scraping, la voix et le montage le restent, et deux séries différentes
+    #: ne s'attendent jamais. Couper avec ``--no-series-order``.
+    series_order: bool = True
+    #: Attente maximale d'un prédécesseur. Passé ce délai, le chapitre part sans mémoire
+    #: plutôt que de bloquer le lot : un chapitre lent ne doit pas geler les autres.
+    series_order_timeout_s: float = 600.0
 
     def __post_init__(self) -> None:
         if self.max_scrape_workers is None:
@@ -90,6 +99,8 @@ class BatchOptions:
         for name in ("max_chapters", "max_gemini_rpm", "max_tts_workers", "max_render_workers", "max_scrape_workers"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} doit etre >= 1")
+        if self.series_order_timeout_s <= 0:
+            raise ValueError("series_order_timeout_s doit etre > 0")
         self.status_file = Path(self.status_file)
         self.out_root = Path(self.out_root)
 
@@ -236,6 +247,32 @@ def urlparse_path_tail(url: str) -> str:
     return segments[-1] if segments else ""
 
 
+def series_predecessors(urls: Sequence[str]) -> dict[str, str]:
+    """``{url: url de l'episode precedent de la meme serie}``, pour la barriere d'ordre.
+
+    La mémoire de série ne fonctionne que si l'épisode N est analysé **après** le N-1 :
+    c'est le N-1 qui écrit la fiche des personnages que le N va relire. Cette table dit,
+    pour chaque chapitre du lot, lequel il doit attendre.
+
+    Deux séries différentes ne s'attendent jamais. Un chapitre sans ``title_no`` ou sans
+    ``episode_no`` n'attend personne et ne fait attendre personne : on ne sait pas où il
+    se place, et le faire patienter le bloquerait pour rien.
+    """
+    by_series: dict[int, list[tuple[int, str]]] = {}
+    for url in urls:
+        title_no, episode_no = parse_ids_from_url(url)
+        if title_no is None or episode_no is None:
+            continue
+        by_series.setdefault(title_no, []).append((episode_no, url))
+
+    predecessors: dict[str, str] = {}
+    for episodes in by_series.values():
+        episodes.sort()
+        for (_, previous), (_, current) in zip(episodes, episodes[1:]):
+            predecessors[current] = previous
+    return predecessors
+
+
 # --- Orchestrateur -----------------------------------------------------------------------------
 @dataclass
 class BatchReport:
@@ -335,6 +372,28 @@ async def process_batch(
     sem_tts = asyncio.Semaphore(batch.max_tts_workers)
     sem_render = asyncio.Semaphore(batch.max_render_workers)
     quota_hit = asyncio.Event()
+    # Barrière d'ordre : un épisode signale ici qu'il a fini son analyse (réussie, ratée ou
+    # ignorée), pour libérer le suivant de sa série. Chaque chemin de sortie doit le faire,
+    # sinon le successeur attend jusqu'au délai de garde.
+    analyzed: dict[str, asyncio.Event] = {url: asyncio.Event() for url in urls}
+    predecessors = series_predecessors(urls) if batch.series_order else {}
+
+    async def wait_for_predecessor(url: str) -> None:
+        """Attend que l'épisode précédent de la même série ait écrit sa fiche.
+
+        L'attente a lieu **hors** de ``sem_chapters`` : la tenir gèlerait le lot entier,
+        puisque le prédécesseur a lui aussi besoin du sémaphore pour avancer.
+        """
+        previous = predecessors.get(url)
+        if previous is None:
+            return
+        try:
+            await asyncio.wait_for(analyzed[previous].wait(), timeout=batch.series_order_timeout_s)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Episode precedent toujours en cours apres %.0fs : %s part sans memoire de serie",
+                batch.series_order_timeout_s, url,
+            )
 
     async def one(url: str) -> None:
         out_dir = batch.out_root / slug_from_url(url)
@@ -342,6 +401,7 @@ async def process_batch(
         if not status.should_process(url, retry_failed=batch.retry_failed, force=options.force or bool(options.redo)):
             report.skipped.append(url)
             logger.info("Chapitre deja %s, ignore : %s", entry["status"], url)
+            analyzed[url].set()  # un chapitre ignore ne doit bloquer personne
             return
         result = PipelineResult(out_dir=out_dir)
         status.update(
@@ -359,10 +419,12 @@ async def process_batch(
                 url, stage="analyze", episode_no=meta.episode_no, title=f"{meta.series_title} - {meta.episode_title}".strip(" -"),
                 n_panels=result.n_panels,
             )
+            await wait_for_predecessor(url)
             async with sem_chapters:
                 if quota_hit.is_set():
                     raise QuotaExhaustedError("quota Gemini epuise sur toutes les cles et tous les modeles (chapitre precedent)")
                 analysis = await asyncio.to_thread(stages.analyze, meta, out_dir, options, result, manager=manager)
+            analyzed[url].set()  # la fiche est ecrite : le chapitre suivant peut demarrer
             status.update(url, stage="tts", model=analysis.model, n_scenes=analysis.n_scenes)
             async with sem_tts:
                 manifest = await asyncio.to_thread(stages.tts, analysis, out_dir, options, result)
@@ -394,6 +456,10 @@ async def process_batch(
                 gemini_s=round(result.gemini_seconds, 1),
             )
             logger.error("Chapitre en echec : %s -> %s", url, message)
+        finally:
+            # Echec, quota epuise, annulation : le successeur repart quand meme. Sans ce
+            # filet, un seul chapitre en erreur fige toute la serie jusqu'au delai de garde.
+            analyzed[url].set()
 
     for url in urls:
         status.get(url)
@@ -565,6 +631,7 @@ __all__ = [
     "BatchReport",
     "read_url_list",
     "resolve_chapter_urls",
+    "series_predecessors",
     "timing_summary",
     "status_timings",
     "format_status",

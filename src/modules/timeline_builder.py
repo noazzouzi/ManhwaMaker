@@ -50,7 +50,7 @@ from src.models.timeline import (
 )
 from src.modules.format_factory import VideoConfigFactory
 from src.modules.framing import make_framing
-from src.modules.pacing import make_pacing
+from src.modules.pacing import content_height, make_pacing
 from src.modules.tts_engine import prepare_text
 from src.utils.audio_assets import bgm_for_mood
 
@@ -159,10 +159,13 @@ def expand_panel_ids(
 ) -> list[list[int]]:
     """Étend chaque scène aux cases **non retenues** qui la suivent, dans l'ordre de lecture.
 
-    L'analyse ne garde que 1 à 4 cases clés par paragraphe et écarte les autres : en mode
-    long c'est voulu, mais le format court réclame bien plus de plans qu'une scène n'a de
-    cases clés (22 contre 3 sur un chapitre mesuré), et rogner huit cadrages dans la même
-    case revient à montrer huit fois le même dessin.
+    L'analyse ne garde que 1 à 4 cases clés par paragraphe et écarte les autres : sur un
+    chapitre mesuré, un peu plus de la moitié des cases découpées n'atteignaient jamais
+    l'écran. Les deux formats s'étendent donc aux cases laissées de côté (drapeau
+    ``PacingRules.expand_to_unused_panels``) : le format court parce qu'il réclame bien
+    plus de plans qu'une scène n'a de cases clés (22 contre 3 sur ce chapitre) et que
+    rogner huit cadrages dans la même case revient à montrer huit fois le même dessin ;
+    le format long parce qu'afficher une case de plus vaut mieux que la laisser au rebut.
 
     Chaque scène reçoit donc la plage contiguë allant de sa première case clé à la
     première case clé de la scène suivante. Les plages sont disjointes et ordonnées, les
@@ -466,7 +469,7 @@ def limit_panels_for_duration(
         return kept
     max_panels = max(1, int(duration_s // min_clip_s))
     if len(kept) > max_panels:
-        by_size = sorted(kept, key=lambda pid: (int(meta_by_index[pid]["height"]), pid), reverse=True)[:max_panels]
+        by_size = sorted(kept, key=lambda pid: (content_height(meta_by_index[pid]), pid), reverse=True)[:max_panels]
         removed = [pid for pid in kept if pid not in by_size]
         kept = [pid for pid in kept if pid in by_size]
         logger.info(
@@ -650,7 +653,7 @@ def build_timeline(
     emotions: dict[int, str] = {}
     scene_spans: list[tuple[int, float, float, str]] = []
     cursor = 0.0
-    # Pre-passage : les scenes montables et leurs cases cles. Le format court a besoin de
+    # Pre-passage : les scenes montables et leurs cases cles. L'elargissement a besoin de
     # les connaitre toutes d'un coup pour s'etendre aux cases laissees de cote.
     montable: list[tuple] = []
     for scene in analysis.scenes:
@@ -664,13 +667,18 @@ def build_timeline(
         if panel_ids:
             montable.append((scene, item, panel_ids))
 
-    if profile.pacing.max_clip_s is not None and montable:
-        widened = expand_panel_ids([ids for _, _, ids in montable], list(meta_by_index))
+    if profile.pacing.expand_to_unused_panels and montable:
+        # Les cases des scenes de remplissage (carton de titre, credits, pub) ne sont pas
+        # "libres" : l'analyse les a ecartees exprès. Les offrir a l'elargissement les
+        # ferait entrer au montage par la bande.
+        filler_ids = {pid for scene in analysis.scenes if scene.is_filler for pid in scene.panel_ids}
+        available = [pid for pid in meta_by_index if pid not in filler_ids]
+        widened = expand_panel_ids([ids for _, _, ids in montable], available)
         before = sum(len(ids) for _, _, ids in montable)
         montable = [(scene, item, ids) for (scene, item, _), ids in zip(montable, widened)]
         logger.info(
-            "Format court : %d cases disponibles pour le montage au lieu de %d (cases cles etendues)",
-            sum(len(ids) for _, _, ids in montable), before,
+            "Format %s : %d cases disponibles pour le montage au lieu de %d (cases cles etendues)",
+            profile.name, sum(len(ids) for _, _, ids in montable), before,
         )
 
     for scene, item, panel_ids in montable:

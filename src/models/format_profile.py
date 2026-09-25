@@ -135,17 +135,37 @@ class PacingRules(BaseModel):
         max_subshots_per_panel: nombre de re-cadrages tirés d'une même case quand la scène
             manque de cases pour tenir la cadence.
         min_shot_s: durée plancher d'un sous-plan, pour ne pas produire de clignotement.
+        expand_to_unused_panels: étendre chaque scène aux cases que l'analyse n'a pas
+            retenues et qui la suivent, au lieu de ne monter que ses cases clés.
+        emphasis_floor_s: plancher d'une case quand le temps de la scène est redistribué.
+        emphasis_ceiling_s: plafond correspondant.
+        heavy_emphasis: part de temps supplémentaire donnée à une case d'impact
+            (``action_heavy_ids``) ; 1.0 = aucune mise en avant.
+        tall_emphasis: idem pour une case plus haute que le cadre, qui demande plus de
+            temps de lecture.
     """
 
     min_clip_s: float | None = 2.5
     max_clip_s: float | None = None
     max_subshots_per_panel: int = Field(ge=1, default=1)
     min_shot_s: float = Field(gt=0, default=0.45)
+    expand_to_unused_panels: bool = False
+    #: Sans redistribution, ``min_clip_s`` sert de socle à *chaque* case et absorbe presque
+    #: toute la durée parlée : il ne reste que ~0,3 s à répartir et toutes les cases
+    #: retombent à la même durée. Mesuré sur un chapitre réel : 78 cases entre 2,57 et
+    #: 2,89 s. Ce plancher plus bas rend le temps distribuable sans changer le **nombre**
+    #: de cases, que ``min_clip_s`` continue de fixer.
+    emphasis_floor_s: float = Field(gt=0, default=1.6)
+    emphasis_ceiling_s: float = Field(gt=0, default=6.0)
+    heavy_emphasis: float = Field(ge=1.0, default=2.0)
+    tall_emphasis: float = Field(ge=1.0, default=1.25)
 
     @model_validator(mode="after")
     def _check_bounds(self) -> PacingRules:
         if self.min_clip_s is not None and self.max_clip_s is not None and self.min_clip_s > self.max_clip_s:
             raise ValueError("min_clip_s ne peut pas depasser max_clip_s")
+        if self.emphasis_floor_s > self.emphasis_ceiling_s:
+            raise ValueError("emphasis_floor_s ne peut pas depasser emphasis_ceiling_s")
         return self
 
 

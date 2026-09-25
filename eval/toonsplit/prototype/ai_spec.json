@@ -1,0 +1,12 @@
+[
+ {"block":0,"role":"key","keep":[{"what":"hero, companion and 4 creatures seen from behind","y":[0.65,1.0]}],
+  "drop":[{"what":"WHOOSH sfx over sky","y":[0.2,0.45]}],"tts":[]},
+ {"block":1,"role":"insert","keep":[{"what":"flag with emblem","y":[0.1,0.95]}],"drop":[],"tts":[]},
+ {"block":2,"role":"key","keep":[{"what":"hero with shovel, companion, creatures","y":[0.3,0.88]}],
+  "drop":[{"what":"narration box","y":[0.0,0.16]}],"tts":["My name is Suho Kim."]},
+ {"block":3,"role":"key","keep":[{"what":"4 creatures shouting + their bubbles","y":[0.0,0.7]}],
+  "drop":[{"what":"detached bubbles below the art","y":[0.7,1.0]}],"tts":["Bbo!","Bang!","Ha!","Ggo!"]},
+ {"block":4,"role":"text_only","keep":[],"drop":[],"tts":["No, in this world, my name is Lloyd Frontera!"]},
+ {"block":5,"role":"key","keep":[{"what":"hero twirling the shovel","y":[0.2,1.0]}],
+  "drop":[{"what":"narration bubble","y":[0.0,0.18]}],"tts":["And this is the story..."]}
+]

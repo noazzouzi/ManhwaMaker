@@ -25,6 +25,20 @@ from src.modules.framing import FramingStrategy
 
 logger = logging.getLogger(__name__)
 
+#: Passes de rattrapage du partage du temps : chacune reborne les durées puis redonne
+#: l'écart aux cases encore libres. Le compte converge en deux ou trois passes ; la limite
+#: n'est qu'un garde-fou contre une oscillation.
+_SHARE_PASSES: int = 12
+
+
+def content_height(entry: Mapping) -> int:
+    """Hauteur de dessin d'une case : celle d'origine, avant agrandissement IA.
+
+    Le temps de lecture dépend de ce que la case contient, pas de sa taille à l'écran :
+    un personnage agrandi (:mod:`src.modules.upscaler`) garde le poids de sa case d'origine.
+    """
+    return int(entry.get("native_height", entry["height"]))
+
 
 class ShotPlan(BaseModel):
     """Un plan : une case, un cadrage, un mouvement, une durée.
@@ -93,8 +107,12 @@ class LongPacing:
     def __init__(self, profile: FormatProfile, framing: FramingStrategy, *, min_panel_weight: int = 400) -> None:
         self.profile = profile
         self.framing = framing
+        self.rules = profile.pacing
         self.min_clip_s = profile.pacing.min_clip_s or 0.0
         self.min_panel_weight = min_panel_weight
+        #: Au-delà, une case ne tient pas dans le cadre en résolution native : il faut plus
+        #: de temps pour la parcourir des yeux.
+        self.frame_height = profile.framing.height
 
     def plan(self, scene_index, panel_ids, duration_s, meta_by_index, heavy_ids=()) -> list[ShotPlan]:
         # Import tardif : ``timeline_builder`` importe ce module, la reference croisee ne
@@ -105,21 +123,59 @@ class LongPacing:
         if not kept:
             return []
         heavy = set(heavy_ids)
-        weights = [max(int(meta_by_index[pid]["height"]), self.min_panel_weight) for pid in kept]
-        total_weight = float(sum(weights))
         n = len(kept)
-        base = self.min_clip_s if n * self.min_clip_s <= duration_s else duration_s / n
-        remainder = max(0.0, duration_s - n * base)
+        weights = [self._weight_of(pid, meta_by_index, heavy) for pid in kept]
+        durations = self._share(duration_s, weights)
         shots: list[ShotPlan] = []
         spent = 0.0
-        for k, (pid, weight) in enumerate(zip(kept, weights)):
+        for k, pid in enumerate(kept):
             entry = meta_by_index[pid]
-            duration = duration_s - spent if k == n - 1 else base + remainder * weight / total_weight
+            duration = duration_s - spent if k == n - 1 else durations[k]
             window = self.framing.windows(entry, 1)[0]
             motion = "punch_in" if pid in heavy else "ken_burns"
             shots.append(_shot(scene_index, pid, entry, window, motion, duration, 0))
             spent += duration
         return shots
+
+    def _weight_of(self, pid: int, meta_by_index, heavy: set[int]) -> float:
+        """Part de la durée de la scène revenant à une case.
+
+        La hauteur reste la base - une grande case demande plus de temps de lecture - mais
+        elle ne suffisait pas : les hauteurs se ressemblent trop pour produire du rythme.
+        L'impact marqué par le modèle (``action_heavy_ids``) est le seul signal qui dit
+        *ce moment compte*, et il était jusqu'ici ignoré dans le partage du temps.
+        """
+        height = content_height(meta_by_index[pid])
+        weight = float(max(height, self.min_panel_weight))
+        if pid in heavy:
+            weight *= self.rules.heavy_emphasis
+        if height > self.frame_height:
+            weight *= self.rules.tall_emphasis
+        return weight
+
+    def _share(self, duration_s: float, weights: Sequence[float]) -> list[float]:
+        """Répartit ``duration_s`` au prorata des poids, borné, **sans en perdre une miette**.
+
+        Le plancher et le plafond sont appliqués puis l'écart est redonné aux cases encore
+        libres, jusqu'à ce que la somme retombe exactement sur la durée parlée : l'image ne
+        doit jamais glisser par rapport à la voix.
+        """
+        n = len(weights)
+        if n == 1:
+            return [duration_s]
+        floor_s = min(self.rules.emphasis_floor_s, duration_s / n)
+        ceiling_s = max(self.rules.emphasis_ceiling_s, duration_s / n)
+        total = float(sum(weights)) or 1.0
+        shares = [duration_s * w / total for w in weights]
+        for _ in range(_SHARE_PASSES):
+            shares = [min(ceiling_s, max(floor_s, s)) for s in shares]
+            gap = duration_s - sum(shares)
+            free = [i for i, s in enumerate(shares) if floor_s < s < ceiling_s]
+            if abs(gap) < 1e-9 or not free:
+                break
+            for i in free:
+                shares[i] += gap / len(free)
+        return shares
 
 
 class ShortPacing:
@@ -193,4 +249,4 @@ def make_pacing(profile: FormatProfile, framing: FramingStrategy) -> PacingStrat
     return LongPacing(profile, framing)
 
 
-__all__ = ["ShotPlan", "PacingStrategy", "LongPacing", "ShortPacing", "make_pacing"]
+__all__ = ["ShotPlan", "PacingStrategy", "LongPacing", "ShortPacing", "content_height", "make_pacing"]

@@ -65,6 +65,7 @@ from src.models.scene import (
     BeatBatch,
     BeatDraft,
     ChapterAnalysis,
+    CharacterCard,
     KeyframeBatch,
     KeyframeChoice,
     ParagraphDraft,
@@ -113,19 +114,30 @@ MAX_CANDIDATES_PER_PARAGRAPH: int = 8
 KEYFRAME_IMAGE_WIDTH: int = 640
 KEYFRAME_SLICE_HEIGHT: int = 1280
 KEYFRAME_MAX_SLICES: int = 2
-#: Longueur cible du script : mots par case narrative (hors remplissage), bornée.
-#: 11 mots par case ~ 4,5 s de voix par case a 146 mots/min.
-SCRIPT_WORDS_PER_PANEL: int = 11
-SCRIPT_MIN_WORDS: int = 250
-SCRIPT_MAX_WORDS: int = 1500
-#: Nombre indicatif de paragraphes : un pour deux beats narratifs, borne.
-SCRIPT_MIN_PARAGRAPHS: int = 4
-SCRIPT_MAX_PARAGRAPHS: int = 40
+#: Étendue maximale, en identifiants, d'une unité de poids 3 (le sommet du chapitre).
+#: Au-delà, le modèle fond plusieurs moments forts dans un seul paragraphe et le pic ne
+#: s'entend plus. Ce n'est **pas** un budget de mots : la longueur du script n'est plus
+#: pilotée du tout (cf. :data:`MASTER_PROMPT_TEMPLATE`).
+PEAK_MAX_SPAN: int = 4
 DEFAULT_MAX_RETRIES: int = 3
 DEFAULT_BACKOFF: float = 2.0
 MAX_BACKOFF: float = 60.0
 RATE_LIMIT_MIN_DELAY: float = 10.0
 DEFAULT_TIMEOUT_MS: int = 120_000
+#: Plafond de jetons de sortie. Sans plafond explicite, une réponse longue est coupée en
+#: plein JSON alors que ``finish_reason`` annonce ``STOP`` : le chapitre échoue en
+#: « JSON invalide » sans qu'on sache pourquoi. Le plus gros appel observé a produit
+#: 3 485 jetons de sortie + 8 123 de réflexion ; 32 768 laisse une marge confortable.
+DEFAULT_MAX_OUTPUT_TOKENS: int = 32_768
+#: Réessais accordés à une réponse **tronquée**. Une fois le plafond posé, une troncature
+#: signale un emballement que le même prompt reproduira : insister brûle du quota.
+TRUNCATION_RETRIES: int = 1
+#: Nombre de chiffres au-delà duquel un entier de la réponse est tenu pour un emballement
+#: du modèle. 18 chiffres couvrent tout entier 64 bits : un identifiant de case en fait 3.
+MAX_INT_DIGITS: int = 18
+#: Valeur substituée à un entier aberrant : hors de toute plage d'identifiants valide,
+#: elle est donc écartée par la validation en aval sans traitement particulier.
+RUNAWAY_INT: int = -1
 #: Délai forcé (secondes) entre deux envois d'un même chapitre (lots d'images, script,
 #: groupes de cases clés) pour étaler la consommation de jetons par minute (TPM).
 #: Redondant avec le limiteur RPM du :class:`~src.utils.gemini_manager.GeminiManager` :
@@ -138,10 +150,23 @@ DEFAULT_KEYFRAME_WORKERS: int = 4
 #: Poids maximal des images inline d'une requête Gemini : la limite dure est de 20 Mo,
 #: on garde une marge pour le texte et l'encodage base64 du transport.
 MAX_INLINE_PAYLOAD_BYTES: int = 16 * 1024 * 1024
-#: Fraction de la longueur visée en dessous de laquelle le script est régénéré une fois
-#: (le mode « une requête » a tendance à trop résumer : 478 mots pour 1441 visés au premier essai).
-SCRIPT_MIN_LENGTH_RATIO: float = 0.65
-
+#: Paliers ``(largeur, qualité)`` essayés dans l'ordre pour faire tenir un chapitre en
+#: **une seule requête**. Basculer en mode deux étapes coûte vingt fois plus d'appels et,
+#: surtout, prive le modèle des images : il ne réécrit alors que des résumés déjà aplatis.
+#: Comprimer un peu plus vaut mieux.
+#:
+#: Mesuré sur un chapitre de 188 cases de 900 px de large (24,6 Mo au premier palier) :
+#: la qualité est le vrai levier, la largeur ne mord qu'en dessous de la taille native.
+#: La lisibilité des bulles a été vérifiée à l'œil jusqu'à 768 px / qualité 72 - le texte
+#: des webtoons est grand et très contrasté, il survit largement à la compression.
+INLINE_PAYLOAD_LADDER: tuple[tuple[int, int], ...] = (
+    (DEFAULT_MAX_IMAGE_WIDTH, JPEG_QUALITY),
+    (DEFAULT_MAX_IMAGE_WIDTH, 75),
+    (DEFAULT_MAX_IMAGE_WIDTH, 65),
+    (832, 65),
+    (768, 62),
+    (640, 60),
+)
 LANGUAGE_NAMES: dict[str, str] = {
     "fr": "francais",
     "en": "English",
@@ -179,6 +204,12 @@ FORBIDDEN_PATTERNS: tuple[str, ...] = (
     r"\bclose-?up\b",
     r"\bzoom(?:s|ed|ing)? (?:in|out)\b",
     r"(?:^|[.!?]\s+)here[,:]?\s",
+    # Le narrateur parle de lui-même ou de son support plutôt que de l'histoire.
+    r"\b(?:the narrator|the protagonist|our (?:hero|protagonist)|the main character)\b",
+    r"\bthe (?:scene|panel|image|page|shot) (?:unfolds|cuts|shifts|switches|changes)\b",
+    r"\bthis (?:chapter|episode) (?:opens|begins|starts|ends|closes|follows|covers)\b",
+    # Volontairement sans « page » : « la dernière page du journal de son père » est du récit.
+    r"\bthe (?:final|last|opening|first) (?:panel|frame|shot)\b",
     r"\bsur cette (?:case|image|planche|vignette)\b",
     r"\bon (?:voit|apercoit|aperçoit|decouvre|découvre)\b",
     r"(?:^|[.!?]\s+)ici[,:]?\s",
@@ -233,6 +264,15 @@ class AnalyzerError(RuntimeError):
 
 class InvalidResponseError(AnalyzerError):
     """Réponse du modèle inexploitable (JSON invalide, aucun élément valide) : réessayable."""
+
+
+class TruncatedResponseError(InvalidResponseError):
+    """Réponse coupée en plein JSON (plafond de jetons atteint, ou fin structurellement absente).
+
+    Sous-classe d':class:`InvalidResponseError` pour rester réessayable, mais nommée à part :
+    réessayer une troncature à l'identique produit presque toujours la même troncature, donc
+    le nombre de tentatives est plafonné par :data:`TRUNCATION_RETRIES`.
+    """
 
 
 class QuotaExhaustedError(AnalyzerError):
@@ -362,75 +402,176 @@ Rules:
    author or publisher notice, advertising, preorder promotion, "to be continued", social links).
 7. Answer only with the requested JSON (an object with the "beats" key)."""
 
-SCRIPT_SYSTEM_INSTRUCTION_TEMPLATE: str = """You are the writer and narrator of a YouTube channel that recaps manhwa / webtoon chapters.
-You receive the ordered story beats of one chapter. Write the complete voice-over SCRIPT of the
-recap in {language}.
+#: Prompt maitre : un seul gabarit pour les deux modes de generation. Entre le mode
+#: « une requete » (images) et le mode en deux etapes (beats), seuls changent la nature des
+#: identifiants et la source des dialogues ; tout le reste - le plan, la voix, les regles de
+#: retention - est commun. Deux gabarits divergeaient silencieusement a chaque retouche.
+#:
+#: Aucune consigne de longueur : cinq essais mesures ont montre que le nombre de mots rendu
+#: par Gemini ne suit pas la cible demandee. Ce qui se pilote, c'est le *poids* de chaque
+#: moment ; la duree se regle en aval, au montage.
+MASTER_PROMPT_TEMPLATE: str = """You are the writer and narrator of a YouTube channel that recaps manhwa chapters in {language}.
+Your viewer has NOT read this series, watches the episodes in order and days apart, and decides
+in thirty seconds whether to stay and in the last five whether to click the next one. You are not
+a camera and not a summary: you are someone who read the chapter and is telling it to one person.
+Your one job is to keep them watching. Answer with ONE JSON object, fields in the order given
+under OUTPUT.
 
-Style (mandatory):
-- Pure retrospective storytelling: recount the events like a narrator telling the story, present
-  tense, third person, then follow the chapter in order and end on its cliffhanger or final
-  revelation.
-- The very first sentence must be a strong HOOK taken from the story itself: an emergency, a
-  deadline, a threat, a mystery or a shocking fact that makes the viewer need to know what
-  happens next. Never open with a generic introduction such as "In this chapter", "Welcome back",
-  "Today we", "Let's dive in", "This recap", "Get ready" or any greeting.
-- Include exactly ONE short call-to-action asking the viewer to subscribe, worded naturally in
-  one sentence (for example "If you're enjoying this recap, subscribe so you never miss the next
-  chapter."), placed in a middle paragraph: never in the first two paragraphs and never as the
-  closing sentence of the script.
-- STRICTLY FORBIDDEN: any reference to the images, panels, drawings, layout or the act of
-  looking. Never write "In this panel", "In this scene", "We see", "Here", "The scene shows",
-  "is shown", "is displayed", "the image", "the camera", "close-up" or any equivalent. If a
-  sentence needs such words, rewrite it as narrated action.
-- Use the character names given in the beats; quote key dialogue briefly or report it
-  indirectly. Vary the rhythm of the sentences. No bullet points, no headings, no emojis.
-- Skip filler beats (title, credits, ads) completely: never mention them.
+========================= INPUT =========================
+{input_block}
+=========================================================
 
-Structure:
-- Split the script into about {target_paragraphs} paragraphs in reading order. Each paragraph
-  covers consecutive beats (give their beat numbers), contains 2 to 4 sentences (about 35 to
-  90 words) and has one dominant emotion among: {emotions}.
-- Every non-filler beat must belong to exactly one paragraph. Total length: about {target_words}
-  words - do not compress the story, give every twist and line of dialogue room to land.
-- Answer only with the requested JSON (an object with the "paragraphs" key)."""
+MEMORY
+{chapter_line}
+Characters established in earlier episodes: {character_sheet}
+Where the last episode ended: {previous_tail}
+Use the canonical name of every character on that sheet, every time. A character not on it gets
+ONE label you invent and repeat word for word all episode ("the boy with glasses"). Never two
+labels for one person, never one name for two people - an ancestor and his descendant are two
+people. If a proper name appears in a bubble and you cannot attach it to anyone, attach it in the
+same sentence ("Eden, the name he carried before he died") or do not use it.
 
-SINGLE_CALL_SYSTEM_INSTRUCTION_TEMPLATE: str = """You are the writer, narrator and video editor of a YouTube channel that recaps
-manhwa / webtoon chapters. You receive EVERY panel of one chapter, in reading order, each preceded
-by its number ("Panel N"). Produce the complete recap in a single pass, in {language}.
+------------------------------- STEP 1: THE PLAN -------------------------------
+Read the whole chapter before writing one word of prose.
 
-For each paragraph of the recap, return:
-- "text": pure retrospective storytelling, present tense, third person, following the chapter in
-  order and ending on its cliffhanger or final revelation.
-  - The very first sentence must be a strong HOOK taken from the story itself: an emergency, a
-    deadline, a threat, a mystery or a shocking fact. Never open with a generic introduction such
-    as "In this chapter", "Welcome back", "Today we", "Let's dive in" or any greeting.
-  - STRICTLY FORBIDDEN: any reference to the images, panels, drawings, layout or the act of
-    looking. Never write "In this panel", "In this scene", "We see", "Here", "The scene shows",
-    "is shown", "is displayed", "the image", "the camera", "close-up" or any equivalent. If a
-    sentence needs such words, rewrite it as narrated action.
-  - Use the character names read in the dialogue; quote key lines briefly or report them
-    indirectly. Vary the rhythm. No bullet points, no headings, no emojis.
-  - Include exactly ONE short call-to-action asking the viewer to subscribe, worded naturally in
-    one sentence, placed in a middle paragraph: never in the first two paragraphs and never as
-    the closing sentence of the script.
-- "emotion": one of {emotions}.
-- "key_panel_ids": 1 to {max_key} panel numbers that illustrate THIS paragraph, in reading order,
-  chosen among the panels this paragraph narrates. Prefer the most striking, complete and readable
-  artwork: faces, decisive moments, establishing shots, large detailed panels. Skip transition
-  panels (text-only, chat messages, sound effects, tiny fragments, empty backgrounds). NEVER reuse
-  a panel number in two paragraphs and never invent a number.
-- "action_heavy_ids": the subset of those key panels showing a DECISIVE IMPACT (a blow landing, an
-  explosion, a roar, a sudden reveal). Leave empty for calm, talking or establishing paragraphs.
+ACTS. Split the ids into four contiguous blocks - setup, turn, climax, cliffhanger - covering
+every story id, in order, no hole, no overlap. Name the PEAK: the one moment that matters (a
+decision, a reveal, the first blow, the last line). It sits in climax or cliffhanger.
 
-Ignore filler panels completely (title cards, credits, ads, author notes): never narrate them and
-never pick them as key panels.
+UNITS. A unit is not a chunk of text: it is WHAT THE VIEWER IS LOOKING AT while you speak.
+When the pictures should change, a new unit starts. Cut the chapter into units in reading
+order, starting a new one roughly every two or three story ids - more often when the images
+change fast. Too few units and the viewer stares at the same picture while you talk on; that
+is the fastest way to lose them. One unit = one paragraph. Units are contiguous and
+together cover every story id exactly once - no story id is left out, ever. Every id you write
+anywhere must exist in the input: never write an id past the last one you were given, and
+never mix the two numbering systems described in the INPUT block. Give each unit a
+weight:
+  weight 1  travel, scenery, arriving, inventory, small talk, and every repetition of an attempt
+            that already failed
+  weight 2  a consequence, a reaction that costs something, or a rule of this world the newcomer
+            needs. Explaining is never a 1.
+  weight 3  a decision, a reveal, a first blow, the peak, the last line
 
-LENGTH IS CRITICAL and the most common mistake is writing far too little. Produce about
-{target_paragraphs} paragraphs covering the whole chapter in reading order. EVERY paragraph must
-be a full 35 to 90 words (3 to 5 sentences) - never a single short sentence. The complete script
-must total about {target_words} words. Do not summarise or compress: narrate the events one after
-another, give every twist, every reaction and every important line of dialogue room to land.
-Answer only with the requested JSON (an object with the "paragraphs" key)."""
+SHAPE. The weight says how much the moment matters, and therefore how much attention it earns.
+Never count words, never aim at a length: the script is exactly as long as the story needs.
+- A weight-1 unit is brief and may swallow many ids: that is how you compress a
+  carriage ride, or four identical failures into one sentence of pattern - "Stone. Blade. A
+  shield. Every time the same three words: insufficient level." Never one paragraph per attempt.
+- A weight-3 unit is the one you linger on, and covers at most {max_span} ids. A climax is several short
+  units in a row, never one long one.
+- The climax and the cliffhanger carry more of the script than the setup. If the setup is the
+  part you dwelt on, you planned it wrong.
+- Unit 0 is weight 3. The last unit of the chapter is weight 3 and stands alone.
+- CTA: name in cta_unit_index the unit sitting closest to 38% of the chapter whose emotion will be
+  neutral, calm, mystery or humor. That paragraph carries exactly one sentence asking the viewer
+  to subscribe, worded freshly this episode, and never as its last sentence. Nowhere else.
+
+------------------------------- STEP 2: THE WRITING -------------------------------
+RETENTION IS THE ONLY CONTRACT. Every paragraph must earn the next one. Cover every unit, in
+order. Never pad: no adjective piles, no restating what you just said, no event that is not in the
+chapter. And never ration yourself either - if a moment deserves to breathe, let it breathe.
+
+VOICE. Present tense, third person, warm, dry, sometimes amused. You know things the hero does not
+and you may tease them.
+- Show the thing; never announce that someone perceives it. realizes, observes, notices, notes,
+  watches, wonders, muses, deduces, contemplates, reflects, considers, ponders: at most twice in
+  the whole script. Not "He realizes the boy is Benny's descendant" - "The boy has Benny's eyes.
+  Benny, who died two hundred years ago."
+- Never label a fact before the story has shown it: no "the true motive", "the fabricated tale",
+  "seemingly", "a startling realization". If the guide lies, let him lie; land the truth after.
+- Weight and pace are two different dials. Weight-3 paragraph: you linger, with SHORTER sentences, verb
+  first, the blow before the reaction, at least one sentence of six words or fewer. Weight-1
+  paragraph: you pass through, dry and quick. Never three sentences of similar length in a row.
+- One adjective per noun. Banned: massive, powerful, overwhelming, incredible, glowing, sheer,
+  utter, colossal. At most one -ly adverb and one figure per paragraph, the figure only if it
+  changes the stakes.
+
+DIALOGUE. The best lines of this chapter are already written, in the bubbles. Steal them.
+- Quoted VERBATIM, always, with no option to report them indirectly: every punchline, every
+  threat, every reveal spoken out loud, and the final line of the chapter. If the chapter ends on
+  a joke, the viewer hears the joke.
+- Everything else is narrated. At most two quoted sentences per paragraph, at most 25 words per
+  quote. If you find yourself transcribing whole exchanges, you have stopped telling the story.
+- NORMALISE FOR THE VOICE. Bubbles are printed in capitals and broken by ellipses; a speech
+  synthesiser reads this aloud. "HOW IS... YOUR GREAT-GRANDFATHER..." becomes "How is your
+  great-grandfather?" Sentence case, one speakable sentence, no internal ellipses, no printed
+  sound effects. Trim and join freely; never add a word that was not said.
+- Every quote is attributed to a named speaker inside its own sentence: Hugh sneers, "..." Never a
+  disembodied shout. Thoughts are quoted in the first person and attributed too, never melted
+  into the narration: Eden thinks, "He's actually Benny's great-grandson?"
+- One line, once: never announce a line then quote it, never quote it then explain it. Banned
+  around a quote: demanding to know, questioning, claiming, proclaiming, stating, noting,
+  explaining, taunting, mocking, pointing out.
+
+CHAINING. This is what keeps the viewer. At least one paragraph in four OPENS on a word reacting
+to the one before: But / Then / Yet / Except / Worse / Too late / Instead / Still / Nothing. Ask
+the viewer a direct question two to four times, at the moments of highest uncertainty, and never
+answer it in the same paragraph. End every paragraph on a new fact, a threat or an open door -
+never on a verdict about what you just said ("the display of power is absolute"), never on a
+", a X." apposition that restates it. Never open on a scene-setting clause ("As the carriage rolls
+on,", "Meanwhile,"): the scene is already there.
+
+CLARITY. When the chapter shows a rule of its world - what a dungeon is, why that class is junk,
+what the System does - state it plainly, once, inside the unit that shows it. That is why a
+newcomer stays. Never cut it for rhythm.
+
+OPEN AND CLOSE. Start inside the action, on a gesture or a quoted line. The first forty words
+contain the hero's canonical name and what he stands to lose. Never a greeting, never "In this
+chapter", and never a pitch of the series ("Mirror World follows Eden, who seeks revenge..."). The
+last paragraph ends on the chapter's final line, quoted, or on a question you do not answer -
+never on a recap of what just happened.
+
+NEVER SPEAK THE MEDIUM. Forbidden anywhere: panel, frame, page, image, artwork, illustration, the
+scene, close-up, the camera, zoom, we see, is shown, is depicted, unfolds, the screen, the
+interface, a notification, a system message, a display, the narrator, the protagonist, our hero.
+(The System as a thing inside the story is allowed; its user interface is not.) No headings, no
+bullets, no emojis, no capitals for emphasis. Filler ids are narrated by nobody and chosen by
+nobody.
+
+------------------------------- OUTPUT -------------------------------
+One JSON object, nothing else. STRICT JSON: every property name in double quotes, every string
+in double quotes, no trailing comma, no comment. Fields in this order - a paragraph's weight comes before its text:
+
+{{"plan":{{"acts":[{{"name":"setup","first_id":0,"last_id":23}},{{"name":"turn","first_id":24,
+"last_id":52}},{{"name":"climax","first_id":53,"last_id":110}},{{"name":"cliffhanger",
+"first_id":111,"last_id":124}}],"peak_id":118,"cta_unit_index":7,
+"units":[{{"id":0,"weight":3,"covers":[0,1,2,3,4]}}]}},
+"paragraphs":[{{"plan_id":0,"weight":3,"text":"...","emotion":"tension","beat_ids":[],
+"key_panel_ids":[1,3],"action_heavy_ids":[3]}}],
+"characters":[{{"name":"Eden","also_called":["the man who died and came back"],
+"who":"The hero, betrayed and killed by Wright Housman, now in a teenager's body."}}]}}
+
+- "emotion": exactly one of {emotions}.
+- "key_panel_ids": 1 to {max_key} panel numbers illustrating THIS paragraph, in reading order,
+  taken from the ids it covers. Prefer faces, decisive gestures, large readable artwork; skip
+  text-only fragments, chat windows, sound-effect panels, empty backgrounds. Never reuse a number
+  in two paragraphs, never invent one, never pick a filler panel.
+- "action_heavy_ids": the subset showing a decisive impact - a blow landing, an explosion, a
+  reveal. Empty for calm, talking or establishing paragraphs.
+- "characters": every character this chapter names, so the next episode can reuse the same names."""
+
+#: Bloc INPUT du mode « une requete » : toutes les cases du chapitre partent en images, et les
+#: dialogues se lisent dans les bulles.
+INPUT_BLOCK_IMAGES: str = """MODE: IMAGES. Every panel of the chapter follows, in reading order, each preceded by its number
+("Panel N"): {n_ids} panels, numbered {first_id} to {last_id}. The ids you plan with - acts, peak,
+units, "covers" - are PANEL numbers, and so are key_panel_ids. Your only dialogue source is the
+text printed in the bubbles: read it, quote it verbatim, normalise its typography. Ignore filler
+panels entirely (title cards, credits, ads, author notes, "to be continued", social links). Leave
+"beat_ids" empty in every paragraph."""
+
+#: Bloc INPUT du mode en deux etapes : le chapitre arrive en texte (beats deja extraits), et les
+#: deux numerotations coexistent - on planifie en beats, on illustre en cases.
+INPUT_BLOCK_BEATS: str = """MODE: BEATS. The chapter arrives as an ordered list of beats, one per line:
+  Beat N (panels a, b, c): what happens | Characters: ... | Dialogue: "..." / "..."
+{n_ids} beats, numbered {first_id} to {last_id}. The ids you plan with - acts, peak, units,
+"covers" - are BEAT numbers, repeated in "beat_ids". key_panel_ids are PANEL numbers, chosen among
+the panels listed on the beats that paragraph covers. Your only dialogue source is the Dialogue
+field: quote it verbatim, and if a beat lists none, invent none. Beats flagged [FILLER] do not
+exist: never narrate them, never cite their panels."""
+
+#: Blocs INPUT par mode, pour :func:`master_instruction`.
+INPUT_BLOCKS: dict[str, str] = {"images": INPUT_BLOCK_IMAGES, "beats": INPUT_BLOCK_BEATS}
 
 KEYFRAMES_SYSTEM_INSTRUCTION_TEMPLATE: str = """You are the video editor of a manhwa recap channel. For each paragraph of the recap script you
 receive its text and its candidate panels (images). Choose the KEY panels that will stay on
@@ -547,6 +688,54 @@ def _chapter_line(meta: ChapterMeta | None) -> str:
     return ""
 
 
+def character_sheet(cards: Sequence[CharacterCard]) -> str:
+    """Fiche des personnages des épisodes précédents, telle qu'injectée dans le prompt maître."""
+    if not cards:
+        return "none yet - this is the first episode you narrate, so every name you use is the canonical one."
+    lines = []
+    for card in cards:
+        aka = f" (also called {', '.join(card.also_called)})" if card.also_called else ""
+        lines.append(f"  - {card.name}{aka}: {card.who}")
+    return "\n" + "\n".join(lines)
+
+
+def master_instruction(
+    *,
+    mode: str,
+    language: str,
+    n_ids: int,
+    first_id: int,
+    last_id: int,
+    meta: ChapterMeta | None = None,
+    max_key: int = MAX_KEY_PANELS_PER_PARAGRAPH,
+    characters: Sequence[CharacterCard] = (),
+    previous_tail: str = "",
+) -> str:
+    """Prompt système complet, pour ``mode`` ``"images"`` (une requête) ou ``"beats"`` (étape 1b).
+
+    Le formatage se fait en **deux passes** : le bloc INPUT porte ``{n_ids}``, ``{first_id}``
+    et ``{last_id}``, il est donc formaté d'abord, puis passé comme *argument* du gabarit.
+    L'insérer par concaténation avant une passe unique laisserait ces trois champs littéraux
+    dans le prompt envoyé à Gemini - c'est arrivé en bac à sable.
+
+    Raises:
+        ValueError: ``mode`` inconnu.
+    """
+    block = INPUT_BLOCKS.get(mode)
+    if block is None:
+        raise ValueError(f"mode inconnu : {mode!r} (attendu {' ou '.join(sorted(INPUT_BLOCKS))})")
+    return MASTER_PROMPT_TEMPLATE.format(
+        language=language_name(language),
+        input_block=block.format(n_ids=n_ids, first_id=first_id, last_id=last_id),
+        chapter_line=_chapter_line(meta) or "This chapter arrives without a title.",
+        character_sheet=character_sheet(characters),
+        previous_tail=previous_tail.strip() or "nothing yet - this is the first episode of the series.",
+        max_span=PEAK_MAX_SPAN,
+        emotions=", ".join(EMOTIONS),
+        max_key=max_key,
+    )
+
+
 def build_beats_header(batch: Sequence[Panel], context: Sequence[BeatDraft], meta: ChapterMeta | None) -> str:
     """Texte d'introduction d'un lot (étape 1a) : chapitre, contexte, cases attendues."""
     lines: list[str] = []
@@ -570,42 +759,30 @@ def build_beats_footer(batch: Sequence[Panel]) -> str:
     )
 
 
-def single_call_targets(panels: Sequence[Panel]) -> tuple[int, int]:
-    """``(mots, paragraphes)`` visés en mode « une requête », à partir du nombre de cases.
-
-    Même barème que le mode en deux étapes (:func:`target_script_words`), mais calculé sur
-    les cases : le remplissage n'est pas encore identifié puisqu'il n'y a pas d'étape beats.
-    """
-    words = int(min(SCRIPT_MAX_WORDS, max(SCRIPT_MIN_WORDS, len(panels) * SCRIPT_WORDS_PER_PANEL)))
-    paragraphs = int(min(SCRIPT_MAX_PARAGRAPHS, max(SCRIPT_MIN_PARAGRAPHS, round(len(panels) / 7))))
-    return words, paragraphs
-
-
 def build_single_call_header(panels: Sequence[Panel], meta: ChapterMeta | None, language: str) -> str:
-    """Texte d'introduction du mode « une requête »."""
+    """Texte d'introduction du mode « une requête ».
+
+    Le cadrage (rôle, plan, style, sortie) vit dans l'instruction système
+    (:func:`master_instruction`) ; il ne reste ici que l'amorce des images.
+    """
     lines: list[str] = []
     chapter = _chapter_line(meta)
     if chapter:
         lines.append(chapter)
-    words, paragraphs = single_call_targets(panels)
-    lines.append(
-        f"Script language: {language_name(language)}. Target length: about {words} words "
-        f"in about {paragraphs} paragraphs."
-    )
+    lines.append(f"Script language: {language_name(language)}.")
     lines.append(f"All {len(panels)} panels of the chapter follow, in reading order:")
     return "\n".join(lines)
 
 
 def build_single_call_footer(panels: Sequence[Panel], max_key: int) -> str:
-    """Rappel final du mode « une requête » (la cible de longueur y est répétée : c'est le
-    message le plus proche de la génération, donc le plus suivi)."""
+    """Rappel final du mode « une requête » : c'est le message le plus proche de la
+    génération, donc le plus suivi - il rappelle les bornes des numéros et le plan."""
     numbers = f"0 to {panels[-1].index}" if panels else "none"
-    words, paragraphs = single_call_targets(panels)
     return (
-        f"End of the chapter ({len(panels)} panels, numbered {numbers}). Write the complete recap now: "
-        f"about {paragraphs} paragraphs of 35 to 90 words each, {words} words in total, in reading order, "
-        f"each with its text, its emotion, 1 to {max_key} key panel numbers taken from that range, and the "
-        "decisive ones in action_heavy_ids. Answer in JSON."
+        f"End of the chapter ({len(panels)} panels, numbered {numbers}). Plan it first, then write the "
+        f"complete recap: every panel number you use anywhere must be in that range. Each paragraph carries "
+        f"its plan_id, its weight, its text, its emotion, 1 to {max_key} key panel numbers and the decisive "
+        "ones in action_heavy_ids. Answer in JSON."
     )
 
 
@@ -674,6 +851,48 @@ def _enforce_reading_order(
         logger.warning("Paragraphe %s recase sur %s apres remise en ordre", index + 1, choice)
 
 
+#: Au-delà de ce nombre de numéros distincts inconnus, la réponse n'est plus « un id de
+#: travers » mais une numérotation entière fausse (le modèle a confondu deux systèmes).
+_WRONG_NUMBERING_MIN: int = 2
+_WRONG_NUMBERING_RATIO: float = 0.2
+
+
+def _reject_if_wrong_numbering(
+    id_lists: Sequence[Sequence[int]], known: dict[int, int], *, what: str, require_one_valid_each: bool = False
+) -> None:
+    """Refuse une réponse dont la numérotation des cases est globalement fausse.
+
+    Les numéros inconnus isolés sont normalement retirés un à un, en silence : c'est la
+    bonne tolérance pour une coquille. Mais une réponse citant 125 numéros pour un
+    chapitre qui en compte 38 — vu une fois, le modèle ayant confondu numéros de case et
+    numéros de beat — passait ce filtre et produisait un recap plausible mais faux. Deux
+    signes distinguent la coquille de l'erreur de système :
+
+    * trop de numéros distincts inconnus, en valeur absolue comme en proportion ;
+    * plus de la moitié des éléments n'ayant plus **aucun** numéro valide.
+
+    Raises:
+        InvalidResponseError: la numérotation est fausse ; l'appel est à refaire.
+    """
+    if not known:
+        return
+    seen = {pid for ids in id_lists for pid in ids}
+    unknown = sorted(seen - known.keys())
+    if not unknown:
+        return
+    limit = max(_WRONG_NUMBERING_MIN, int(_WRONG_NUMBERING_RATIO * len(known)))
+    orphans = sum(1 for ids in id_lists if ids and not (set(ids) & known.keys()))
+    too_many = len(unknown) > limit
+    too_lost = require_one_valid_each and id_lists and orphans > len(id_lists) / 2
+    if not (too_many or too_lost):
+        return
+    raise InvalidResponseError(
+        f"Numerotation des cases incoherente ({what}) : {len(unknown)} numero(s) inconnu(s) "
+        f"jusqu'a {unknown[-1]}, alors que la derniere case est {max(known)} "
+        f"({orphans}/{len(id_lists)} sans aucun numero valide)"
+    )
+
+
 def normalize_recap(
     paragraphs: Sequence[RecapParagraph], panels: Sequence[Panel], *, max_key: int = MAX_KEY_PANELS_PER_PARAGRAPH
 ) -> list[tuple[ParagraphDraft, list[int], list[int]]]:
@@ -688,6 +907,9 @@ def normalize_recap(
         ``[(paragraphe, cases clés, cases action_heavy)]`` dans l'ordre de lecture.
     """
     heights = {panel.index: panel.height for panel in panels}
+    _reject_if_wrong_numbering(
+        [p.key_panel_ids for p in paragraphs], heights, what="paragraphe", require_one_valid_each=True
+    )
     free = [panel.index for panel in panels]
     used: set[int] = set()
     drafts: list[ParagraphDraft] = []
@@ -728,28 +950,13 @@ def normalize_recap(
     ]
 
 
-def target_script_words(beats: Sequence[BeatDraft]) -> int:
-    """Longueur cible du script (mots) selon le nombre de cases narratives (hors remplissage)."""
-    n_story_panels = sum(len(beat.panel_ids) for beat in beats if not beat.is_filler)
-    return int(min(SCRIPT_MAX_WORDS, max(SCRIPT_MIN_WORDS, n_story_panels * SCRIPT_WORDS_PER_PANEL)))
-
-
-def target_paragraphs(beats: Sequence[BeatDraft]) -> int:
-    """Nombre indicatif de paragraphes du script (un pour deux beats narratifs, borné)."""
-    n_story = sum(1 for beat in beats if not beat.is_filler)
-    return int(min(SCRIPT_MAX_PARAGRAPHS, max(SCRIPT_MIN_PARAGRAPHS, round(n_story / 2))))
-
-
 def build_script_prompt(beats: Sequence[Beat], meta: ChapterMeta | None, language: str) -> str:
     """Prompt utilisateur de l'étape 1b : tous les beats du chapitre en texte."""
     lines: list[str] = []
     chapter = _chapter_line(meta)
     if chapter:
         lines.append(chapter)
-    lines.append(
-        f"Script language: {language_name(language)}. Target length: about {target_script_words(beats)} words "
-        f"in about {target_paragraphs(beats)} paragraphs."
-    )
+    lines.append(f"Script language: {language_name(language)}.")
     lines.append("Story beats in reading order:")
     for beat in beats:
         ids = ", ".join(str(pid) for pid in beat.panel_ids)
@@ -761,7 +968,10 @@ def build_script_prompt(beats: Sequence[Beat], meta: ChapterMeta | None, languag
             quotes = " / ".join(f'"{q}"' for q in beat.dialogue)
             line += f" | Dialogue: {quotes}"
         lines.append(line)
-    lines.append("Write the complete recap script now, as JSON paragraphs with their beat numbers.")
+    lines.append(
+        "Plan the chapter first, then write the complete recap script: JSON paragraphs, each with its "
+        "plan_id, its weight and the beat numbers it covers."
+    )
     return "\n".join(lines)
 
 
@@ -798,19 +1008,142 @@ def _strip_code_fence(text: str) -> str:
     return match.group(1) if match else text
 
 
+#: Clé JSON écrite sans guillemets (``plan_id: 0``), faute la plus fréquente du modèle.
+_BARE_KEY = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)')
+#: Virgule traînante avant une fermeture.
+_TRAILING_COMMA = re.compile(r',(\s*[}\]])')
+#: Valeur nue glissée entre deux paires d'un objet (``"weight":1,-1,"text":...``). Le
+#: lookahead exige une **clé suivie de deux-points** : dans un tableau, ``[1,-1,2]``, le
+#: jeton suivant n'est jamais une clé, donc un tableau valide n'est jamais touché.
+_STRAY_VALUE = re.compile(r',\s*-?\d+(?:\.\d+)?(?=\s*,\s*"[^"]*"\s*:)')
+
+
+def _outside_string_spans(text: str) -> list[tuple[int, int]]:
+    """Intervalles de ``text`` situés **hors** des chaînes JSON, échappements compris.
+
+    Toute réparation doit se limiter à ces intervalles : une narration contenant
+    ``Hugh sneers, "Listen: the gate opens at dawn."`` ressemble à une clé nue, et une
+    réparation naïve la réécrit — donc corrompt le script rendu à l'utilisateur.
+    """
+    spans: list[tuple[int, int]] = []
+    start, in_string, escaped = 0, False, False
+    for i, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string, start = False, i + 1
+        elif char == '"':
+            spans.append((start, i))
+            in_string = True
+    if not in_string:
+        spans.append((start, len(text)))
+    return spans
+
+
+def _repair_json(text: str) -> str:
+    """Corrige les fautes de syntaxe courantes du modèle, **hors** du contenu des chaînes.
+
+    Trois corrections, toutes sans ambiguïté : clés sans guillemets, virgules traînantes,
+    et valeur nue glissée entre deux paires d'un objet. Chacune est réparée localement
+    plutôt que par un second appel Gemini, qui coûterait une unité de quota.
+    """
+    def apply(pattern: re.Pattern[str], replace: Callable[[re.Match[str]], str], source: str) -> str:
+        # Les motifs sont cherchés sur le texte ENTIER (un lookahead doit pouvoir regarder
+        # par-dessus une chaîne voisine), mais seule une correspondance qui COMMENCE hors
+        # d'une chaîne est appliquée.
+        spans = _outside_string_spans(source)
+        return pattern.sub(
+            lambda m: replace(m) if any(b <= m.start() < e for b, e in spans) else m.group(0),
+            source,
+        )
+
+    text = apply(_BARE_KEY, lambda m: f'{m.group(1)}"{m.group(2)}"{m.group(3)}', text)
+    text = apply(_TRAILING_COMMA, lambda m: m.group(1), text)
+    return apply(_STRAY_VALUE, lambda m: "", text)
+
+
+def _looks_truncated(text: str) -> bool:
+    """Vrai si le texte est un JSON **coupé en plein vol**, pas du bavardage.
+
+    Regarder le dernier caractère ne suffit pas : une réponse coupée juste après un objet
+    complet se termine par ``}`` tout en laissant le tableau parent ouvert. On compte donc
+    les ouvertures non refermées, en ignorant celles qui sont à l'intérieur d'une chaîne.
+    """
+    stripped = text.strip()
+    if not stripped.startswith(("{", "[")):
+        return False  # du texte libre : le modèle a répondu autre chose que du JSON
+    depth, in_string, escaped = 0, False, False
+    for char in stripped:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "{[":
+            depth += 1
+        elif char in "}]":
+            depth -= 1
+    return in_string or depth > 0
+
+
+def _safe_int(digits: str) -> int:
+    """Entier d'une réponse, ou :data:`RUNAWAY_INT` si le modèle s'est emballé sur un chiffre.
+
+    Vu en production : une réponse contenant un entier de 5 234 chiffres. Python refuse de
+    convertir au-delà de 4 300 chiffres (garde-fou contre un déni de service), et
+    ``json.loads`` lève alors un :class:`ValueError` ordinaire - pas un
+    :class:`json.JSONDecodeError`. Tout le reste du JSON était pourtant valide.
+
+    Plutôt que de jeter la réponse et de rebrûler un appel Gemini, on remplace le nombre
+    aberrant par une valeur que la validation des identifiants écarte ensuite d'elle-même.
+    """
+    if len(digits.lstrip("-")) > MAX_INT_DIGITS:
+        logger.warning(
+            "Entier aberrant dans la reponse (%d chiffres) : remplace par %d", len(digits), RUNAWAY_INT
+        )
+        return RUNAWAY_INT
+    return int(digits)
+
+
+def _loads(text: str) -> Any:
+    """``json.loads`` avec le garde-fou de :func:`_safe_int` sur les entiers."""
+    return json.loads(text, parse_int=_safe_int)
+
+
 def _extract_json(text: str) -> Any:
     """Décode le JSON d'une réponse, en tolérant du texte parasite autour de l'objet."""
     text = _strip_code_fence(text)
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as first_error:
+        return _loads(text)
+    # ValueError et non JSONDecodeError : un entier impossible a convertir leve le parent,
+    # et la difference a suffi a faire echouer un chapitre entier au lieu d'un reessai.
+    except ValueError as first_error:
         for opener, closer in (("{", "}"), ("[", "]")):
             start, end = text.find(opener), text.rfind(closer)
             if 0 <= start < end:
                 try:
-                    return json.loads(text[start : end + 1])
-                except json.JSONDecodeError:
+                    return _loads(text[start : end + 1])
+                except ValueError:
                     continue
+        # Reparation locale : evite un aller-retour Gemini (et donc une unite de quota)
+        # pour une cle sans guillemets ou une virgule en trop.
+        repaired = _repair_json(text)
+        if repaired != text:
+            try:
+                return _loads(repaired)
+            except ValueError:
+                pass
+        if _looks_truncated(text):
+            raise TruncatedResponseError(
+                f"Reponse tronquee : JSON incomplet ({len(text)} caracteres, fin inattendue)"
+            ) from first_error
         raise InvalidResponseError(f"JSON invalide dans la reponse du modele : {first_error}") from first_error
 
 
@@ -879,21 +1212,35 @@ def response_data(response: Any, model_cls: type[BaseModel]) -> Any:
         message = getattr(feedback, "block_reason_message", None) or ""
         raise AnalyzerError(f"Prompt bloque par Gemini (block_reason={block_reason}) {message}".rstrip())
     text = getattr(response, "text", None)
+    finish = _finish_reason(response)
     if not text:
-        finish = _finish_reason(response)
         if finish in _FATAL_FINISH_REASONS:
             raise AnalyzerError(f"Reponse refusee par Gemini (finish_reason={finish})")
         raise InvalidResponseError(f"Reponse vide du modele (finish_reason={finish or 'inconnu'})")
+    # Une reponse coupee au plafond de jetons arrive AVEC du texte : sans ce test elle
+    # ressortirait en « JSON invalide », et on chercherait le bug du mauvais cote.
+    if finish == "MAX_TOKENS":
+        raise TruncatedResponseError(
+            f"Reponse tronquee par le plafond de jetons (finish_reason={finish}, {len(text)} caracteres)"
+        )
     return _extract_json(text)
 
 
-def _validate_list(data: Any, model_cls: type[BaseModel], list_key: str, fix_item: Callable[[dict], None]) -> BaseModel:
+def _validate_list(
+    data: Any,
+    model_cls: type[BaseModel],
+    list_key: str,
+    fix_item: Callable[[dict], None],
+    fix_root: Callable[[dict], None] | None = None,
+) -> BaseModel:
     if isinstance(data, model_cls):
         return data
     if isinstance(data, list):
         data = {list_key: data}
     if not isinstance(data, dict) or not isinstance(data.get(list_key), list):
         raise InvalidResponseError(f"Reponse sans liste '{list_key}'")
+    if fix_root is not None:
+        fix_root(data)
     for item in data[list_key]:
         if isinstance(item, dict):
             fix_item(item)
@@ -916,11 +1263,49 @@ def _fix_beat(item: dict) -> None:
         item["summary"] = item["narration"]
 
 
+def _coerce_weight(value: object) -> int:
+    """Ramène le poids d'un paragraphe dans [1, 3] ; 2 (conséquence) par défaut."""
+    try:
+        return max(1, min(3, int(value)))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 2
+
+
+def _fix_plan_fields(item: dict) -> None:
+    """Complète ``plan_id`` et ``weight``, absents des réponses (et des anciens fichiers)."""
+    item["weight"] = _coerce_weight(item.get("weight", 2))
+    try:
+        item["plan_id"] = int(item.get("plan_id", -1))
+    except (TypeError, ValueError):
+        item["plan_id"] = -1
+
+
+def _fix_master(data: dict) -> None:
+    """Tolère une réponse sans plan ni fiche personnages plutôt que de la rejeter.
+
+    Rejeter coûterait un appel Gemini entier — cher sur le palier gratuit — pour une
+    partie de la réponse dont l'absence ne casse rien en aval : le plan n'est qu'une trace
+    du raisonnement, et la fiche des personnages ne sert qu'au chapitre suivant.
+    """
+    if not isinstance(data.get("plan"), dict):
+        logger.warning("Reponse sans plan : accepte tel quel, le plan restera vide")
+        data["plan"] = {"acts": [], "peak_id": -1, "cta_unit_index": -1, "units": []}
+    characters = data.get("characters")
+    if not isinstance(characters, list):
+        data["characters"] = []
+    else:
+        for card in characters:
+            if isinstance(card, dict):
+                card.setdefault("also_called", [])
+                card.setdefault("who", "")
+
+
 def _fix_paragraph(item: dict) -> None:
     item["emotion"] = coerce_emotion(item.get("emotion"))
     if "text" not in item and "narration" in item:
         item["text"] = item["narration"]
     item.setdefault("beat_ids", [])
+    _fix_plan_fields(item)
 
 
 def _fix_choice(item: dict) -> None:
@@ -944,9 +1329,22 @@ def parse_beats(response: Any) -> list[BeatDraft]:
     return list(_validate_list(response_data(response, BeatBatch), BeatBatch, "beats", _fix_beat).beats)
 
 
+def parse_master_script(response: Any) -> ScriptDraft:
+    """Réponse complète de l'étape 1b : plan, paragraphes **et** fiche des personnages.
+
+    Une réponse sans plan ni personnages est complétée plutôt que rejetée
+    (cf. :func:`_fix_master`) : la refuser coûterait un appel Gemini entier.
+    """
+    draft = _validate_list(
+        response_data(response, ScriptDraft), ScriptDraft, "paragraphs", _fix_paragraph, _fix_master
+    )
+    assert isinstance(draft, ScriptDraft)
+    return draft
+
+
 def parse_script(response: Any) -> list[ParagraphDraft]:
-    """Extrait les paragraphes (``ScriptDraft``) d'une réponse."""
-    return list(_validate_list(response_data(response, ScriptDraft), ScriptDraft, "paragraphs", _fix_paragraph).paragraphs)
+    """Paragraphes seuls (``ScriptDraft``) : vue étroite de :func:`parse_master_script`."""
+    return list(parse_master_script(response).paragraphs)
 
 
 def _fix_recap(item: dict) -> None:
@@ -956,11 +1354,21 @@ def _fix_recap(item: dict) -> None:
     for field in ("key_panel_ids", "action_heavy_ids"):
         value = item.get(field)
         item[field] = [int(x) for x in value] if isinstance(value, list) else []
+    _fix_plan_fields(item)
+
+
+def parse_master_recap(response: Any) -> RecapDraft:
+    """Réponse complète du mode « une requête » : plan, paragraphes et personnages."""
+    draft = _validate_list(
+        response_data(response, RecapDraft), RecapDraft, "paragraphs", _fix_recap, _fix_master
+    )
+    assert isinstance(draft, RecapDraft)
+    return draft
 
 
 def parse_recap(response: Any) -> list[RecapParagraph]:
-    """Extrait les paragraphes du mode « une requête » (``RecapDraft``) d'une réponse."""
-    return list(_validate_list(response_data(response, RecapDraft), RecapDraft, "paragraphs", _fix_recap).paragraphs)
+    """Paragraphes seuls (``RecapDraft``) : vue étroite de :func:`parse_master_recap`."""
+    return list(parse_master_recap(response).paragraphs)
 
 
 def parse_keyframes(response: Any) -> list[KeyframeChoice]:
@@ -1098,6 +1506,27 @@ def cta_paragraph_index(n_paragraphs: int, position: float = CTA_POSITION) -> in
     return max(0, min(n_paragraphs - 2, wanted))
 
 
+def _model_cta_is_well_placed(paragraphs: Sequence[ParagraphDraft]) -> bool:
+    """``True`` si le modèle a écrit **un seul** appel à l'abonnement, et au bon endroit.
+
+    Le prompt maître demande une formulation neuve à chaque épisode : quand le modèle obéit,
+    sa phrase vaut mieux que la nôtre, toujours identique. On ne la remplace donc que si elle
+    est mal placée - dans les deux premiers paragraphes, dans le dernier, ou en clôture de son
+    propre paragraphe, les trois endroits où elle coupe la rétention.
+    """
+    hits = [
+        (i, position, len(sentences))
+        for i, paragraph in enumerate(paragraphs)
+        for sentences in [split_sentences(paragraph.text)]
+        for position, sentence in enumerate(sentences)
+        if CTA_PATTERN.search(sentence)
+    ]
+    if len(hits) != 1 or len(paragraphs) < 4:
+        return False
+    index, position, n_sentences = hits[0]
+    return 2 <= index <= len(paragraphs) - 2 and position < n_sentences - 1
+
+
 def enforce_script_conventions(
     paragraphs: Sequence[ParagraphDraft], *, language: str = DEFAULT_LANGUAGE, cta_text: str | None = None
 ) -> list[ParagraphDraft]:
@@ -1122,6 +1551,10 @@ def enforce_script_conventions(
             result[0] = result[0].model_copy(update={"text": " ".join(sentences[1:])})
         else:
             logger.warning("Introduction generique conservee (seule phrase du paragraphe) : %r", intro[:80])
+
+    if cta_text is None and _model_cta_is_well_placed(result):
+        logger.info("Appel a l'abonnement du modele conserve (place et formule correctement)")
+        return result
 
     removed = 0
     for i, paragraph in enumerate(result):
@@ -1177,6 +1610,9 @@ def normalize_keyframes(
         used: cases déjà retenues par des paragraphes précédents (mis à jour).
         max_key: nombre maximal de cases clés par paragraphe.
     """
+    # Seul le critere "trop de numeros inconnus" s'applique ici : un groupe sans aucune
+    # case clé est un repli legitime et frequent a l'etape 2, pas une erreur de reponse.
+    _reject_if_wrong_numbering([c.key_panel_ids for c in choices], heights, what="groupe de cases cles")
     by_paragraph: dict[int, list[int]] = {}
     for choice in choices:
         by_paragraph.setdefault(choice.paragraph_index, []).extend(choice.key_panel_ids)
@@ -1327,15 +1763,19 @@ class GeminiAnalyzer:
         language: str = DEFAULT_LANGUAGE,
         temperature: float = DEFAULT_TEMPERATURE,
         max_image_width: int = DEFAULT_MAX_IMAGE_WIDTH,
+        jpeg_quality: int = JPEG_QUALITY,
         max_slice_height: int = DEFAULT_MAX_SLICE_HEIGHT,
         max_key_panels: int = MAX_KEY_PANELS_PER_PARAGRAPH,
         max_retries: int = DEFAULT_MAX_RETRIES,
         backoff: float = DEFAULT_BACKOFF,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
+        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         delay_between_batches: float = BATCH_DELAY_S,
         keyframe_workers: int = DEFAULT_KEYFRAME_WORKERS,
         thinking_budget: int | None = None,
         cta_text: str | None = None,
+        known_characters: Sequence[CharacterCard] = (),
+        previous_tail: str = "",
         api_key: str | None = None,
     ) -> None:
         if not 1 <= batch_size <= MAX_BATCH_SIZE:
@@ -1344,8 +1784,12 @@ class GeminiAnalyzer:
             raise ValueError("max_retries doit etre >= 0")
         if max_image_width < 1 or max_slice_height < 1:
             raise ValueError("max_image_width et max_slice_height doivent etre >= 1")
+        if not 1 <= jpeg_quality <= 95:
+            raise ValueError(f"jpeg_quality doit etre entre 1 et 95, recu {jpeg_quality}")
         if timeout_ms < 1:
             raise ValueError("timeout_ms doit etre >= 1")
+        if max_output_tokens < 1:
+            raise ValueError("max_output_tokens doit etre >= 1")
         if max_key_panels < 1:
             raise ValueError("max_key_panels doit etre >= 1")
         self.model = resolve_model(model)
@@ -1353,15 +1797,24 @@ class GeminiAnalyzer:
         self.language = language
         self.temperature = temperature
         self.max_image_width = max_image_width
+        self.jpeg_quality = jpeg_quality
         self.max_slice_height = max_slice_height
         self.max_key_panels = max_key_panels
         self.max_retries = max_retries
         self.backoff = backoff
         self.timeout_ms = timeout_ms
+        self.max_output_tokens = max_output_tokens
         self.delay_between_batches = delay_between_batches
         self.keyframe_workers = max(1, keyframe_workers)
         self.thinking_budget = thinking_budget
         self.cta_text = cta_text
+        #: Mémoire de série : personnages déjà nommés et fin du chapitre précédent, injectés
+        #: dans le prompt maître pour que le héros garde son nom d'un épisode à l'autre.
+        self.known_characters = list(known_characters)
+        self.previous_tail = previous_tail
+        #: Fiche rendue par le modèle pour le chapitre en cours, recueillie au parsing et
+        #: reportée dans :class:`ChapterAnalysis` : c'est elle qui nourrira le chapitre suivant.
+        self._last_characters: list[CharacterCard] = []
         self._client: Any | None = None
         self._manager: GeminiManager | None = None
         if client is not None:
@@ -1391,6 +1844,7 @@ class GeminiAnalyzer:
             response_mime_type="application/json",
             response_schema=schema,
             temperature=self.temperature,
+            max_output_tokens=self.max_output_tokens,
             http_options=types.HttpOptions(timeout=self.timeout_ms),
             thinking_config=(
                 types.ThinkingConfig(thinking_budget=self.thinking_budget) if self.thinking_budget is not None else None
@@ -1402,20 +1856,31 @@ class GeminiAnalyzer:
     def beats_config(self) -> types.GenerateContentConfig:
         return self.config_for(BEATS_SYSTEM_INSTRUCTION, BeatBatch)
 
-    def script_config(self, beats: Sequence[BeatDraft]) -> types.GenerateContentConfig:
-        instruction = SCRIPT_SYSTEM_INSTRUCTION_TEMPLATE.format(
-            language=language_name(self.language), emotions=", ".join(EMOTIONS),
-            target_words=target_script_words(beats), target_paragraphs=target_paragraphs(beats),
+    def _master_instruction(self, mode: str, ids: Sequence[int], meta: ChapterMeta | None) -> str:
+        """Prompt maître pour ce mode, borné par les identifiants réellement envoyés."""
+        return master_instruction(
+            mode=mode,
+            language=self.language,
+            n_ids=len(ids),
+            first_id=ids[0] if ids else 0,
+            last_id=ids[-1] if ids else 0,
+            meta=meta,
+            max_key=self.max_key_panels,
+            characters=self.known_characters,
+            previous_tail=self.previous_tail,
         )
-        return self.config_for(instruction, ScriptDraft)
 
-    def single_call_config(self, panels: Sequence[Panel]) -> types.GenerateContentConfig:
-        words, paragraphs = single_call_targets(panels)
-        instruction = SINGLE_CALL_SYSTEM_INSTRUCTION_TEMPLATE.format(
-            language=language_name(self.language), emotions=", ".join(EMOTIONS),
-            max_key=self.max_key_panels, target_words=words, target_paragraphs=paragraphs,
-        )
-        return self.config_for(instruction, RecapDraft)
+    def script_config(
+        self, beats: Sequence[Beat], meta: ChapterMeta | None = None
+    ) -> types.GenerateContentConfig:
+        ids = [beat.index for beat in beats]
+        return self.config_for(self._master_instruction("beats", ids, meta), ScriptDraft)
+
+    def single_call_config(
+        self, panels: Sequence[Panel], meta: ChapterMeta | None = None
+    ) -> types.GenerateContentConfig:
+        ids = [panel.index for panel in panels]
+        return self.config_for(self._master_instruction("images", ids, meta), RecapDraft)
 
     @property
     def keyframes_config(self) -> types.GenerateContentConfig:
@@ -1427,9 +1892,13 @@ class GeminiAnalyzer:
             slices = encode_panel_image(
                 panel, max_width=min(self.max_image_width, KEYFRAME_IMAGE_WIDTH),
                 max_slice_height=min(self.max_slice_height, KEYFRAME_SLICE_HEIGHT), max_slices=KEYFRAME_MAX_SLICES,
+                quality=self.jpeg_quality,
             )
         else:
-            slices = encode_panel_image(panel, max_width=self.max_image_width, max_slice_height=self.max_slice_height)
+            slices = encode_panel_image(
+                panel, max_width=self.max_image_width, max_slice_height=self.max_slice_height,
+                quality=self.jpeg_quality,
+            )
         parts = [types.Part.from_text(text=panel_caption(panel, len(slices)))]
         for k, (data, mime) in enumerate(slices, start=1):
             if len(slices) > 1:
@@ -1460,8 +1929,50 @@ class GeminiAnalyzer:
         return sum(
             len(data)
             for panel in panels
-            for data, _ in encode_panel_image(panel, max_width=self.max_image_width, max_slice_height=self.max_slice_height)
+            for data, _ in encode_panel_image(
+                panel, max_width=self.max_image_width, max_slice_height=self.max_slice_height,
+                quality=self.jpeg_quality,
+            )
         )
+
+    def fit_for_single_call(
+        self, panels: Sequence[Panel], *, limit: int = MAX_INLINE_PAYLOAD_BYTES
+    ) -> bool:
+        """Comprime les images jusqu'à ce que le chapitre tienne en une requête.
+
+        Descend :data:`INLINE_PAYLOAD_LADDER` et s'arrête au premier palier qui passe sous
+        ``limit``, en fixant ``max_image_width`` et ``jpeg_quality`` en conséquence.
+
+        L'enjeu n'est pas le quota mais la **qualité du script** : en mode deux étapes, le
+        modèle qui écrit ne voit aucune image, il ne fait que reformuler des résumés déjà
+        aplatis par l'étape beats. Mieux vaut un JPEG plus compressé - les bulles de webtoon
+        restent lisibles bien en dessous - qu'un récit écrit à l'aveugle.
+
+        Returns:
+            ``True`` si un palier convient (réglages appliqués), ``False`` s'il faut
+            se rabattre sur le mode en deux étapes.
+        """
+        if not panels:
+            return True
+        for width, quality in INLINE_PAYLOAD_LADDER:
+            self.max_image_width, self.jpeg_quality = width, quality
+            payload = self.payload_bytes(panels)
+            if payload <= limit:
+                logger.info(
+                    "Requete unique : %.1f Mo a %d px / qualite %d (plafond %.0f Mo)",
+                    payload / 1_048_576, width, quality, limit / 1_048_576,
+                )
+                return True
+            logger.info(
+                "Palier %d px / qualite %d trop lourd (%.1f Mo) : compression suivante",
+                width, quality, payload / 1_048_576,
+            )
+        logger.warning(
+            "Chapitre trop lourd meme au palier le plus compresse (%d px / qualite %d) : "
+            "retour au mode en deux etapes",
+            *INLINE_PAYLOAD_LADDER[-1],
+        )
+        return False
 
     def build_script_contents(self, beats: Sequence[Beat], meta: ChapterMeta | None = None) -> list[types.Part]:
         """``Part`` (texte seul) de l'étape 1b."""
@@ -1514,6 +2025,7 @@ class GeminiAnalyzer:
             return self._generate_via_manager(contents, config, parse, label)
         attempts = self.max_retries + 1
         last_error: Exception | None = None
+        truncations = 0
         for attempt in range(1, attempts + 1):
             try:
                 if self.n_calls and self.delay_between_batches > 0:
@@ -1532,6 +2044,12 @@ class GeminiAnalyzer:
                     if is_daily_quota_error(exc):
                         raise QuotaExhaustedError(f"{label} : {QUOTA_HINT} ({self.model})") from exc
                     raise AnalyzerError(f"Erreur definitive Gemini ({label}) : {type(exc).__name__}: {exc}") from exc
+                if isinstance(exc, TruncatedResponseError):
+                    # Reessayer une troncature a l'identique la reproduit presque toujours :
+                    # insister brulerait du quota pour rien.
+                    truncations += 1
+                    if truncations > TRUNCATION_RETRIES:
+                        raise
                 last_error = exc
                 logger.warning("%s : tentative %d/%d echouee (%s: %s)", label, attempt, attempts, type(exc).__name__, exc)
                 if attempt < attempts:
@@ -1542,6 +2060,7 @@ class GeminiAnalyzer:
         assert self._manager is not None
         attempts = self.max_retries + 1
         last_error: Exception | None = None
+        truncations = 0
         for attempt in range(1, attempts + 1):
             with self._counters:
                 first_call = self.n_calls == 0
@@ -1565,6 +2084,13 @@ class GeminiAnalyzer:
             try:
                 return parse(response)
             except InvalidResponseError as exc:
+                if isinstance(exc, TruncatedResponseError):
+                    # Meme regle que la boucle a client injecte : une troncature ne se
+                    # rejoue qu'une fois, sinon on paie plusieurs unites de quota pour
+                    # obtenir exactement la meme coupure.
+                    truncations += 1
+                    if truncations > TRUNCATION_RETRIES:
+                        raise
                 last_error = exc
                 logger.warning("%s : reponse invalide (tentative %d/%d) : %s", label, attempt, attempts, exc)
         raise AnalyzerError(f"Abandon ({label}) apres {attempts} tentative(s) : {type(last_error).__name__}: {last_error}") from last_error
@@ -1599,8 +2125,13 @@ class GeminiAnalyzer:
     def write_script(self, beats: Sequence[Beat], meta: ChapterMeta | None = None) -> list[ParagraphDraft]:
         """Étape 1b : script global, régénéré une fois si des formules visuelles subsistent."""
         contents = self.build_script_contents(beats, meta)
-        config = self.script_config(beats)
-        paragraphs = self.generate(contents, config, lambda r: normalize_script(parse_script(r), beats), "script")
+        config = self.script_config(beats, meta)
+        def parse(response: Any) -> list[ParagraphDraft]:
+            draft = parse_master_script(response)
+            self._remember_characters(draft.characters)
+            return normalize_script(draft.paragraphs, beats)
+
+        paragraphs = self.generate(contents, config, parse, "script")
         violations = [hit for p in paragraphs for hit in find_forbidden(p.text)]
         intro = generic_intro(paragraphs[0].text) if paragraphs else None
         if violations or intro:
@@ -1754,48 +2285,39 @@ class GeminiAnalyzer:
         l'abonnement unique et bien placé, cases clés valides et jamais réutilisées.
         """
         contents = self.build_single_call_contents(panels, meta)
-        config = self.single_call_config(panels)
-        parse = lambda r: normalize_recap(parse_recap(r), panels, max_key=self.max_key_panels)  # noqa: E731
+        config = self.single_call_config(panels, meta)
+        def parse(response: Any) -> list[tuple[RecapParagraph, list[int], list[int]]]:
+            draft = parse_master_recap(response)
+            self._remember_characters(draft.characters)
+            return normalize_recap(draft.paragraphs, panels, max_key=self.max_key_panels)
+
         entries = self.generate(contents, config, parse, "recap complet")
 
         paragraphs = [draft for draft, _, _ in entries]
-        target_words, _ = single_call_targets(panels)
-        written = sum(len(p.text.split()) for p in paragraphs)
         violations = [hit for p in paragraphs for hit in find_forbidden(p.text)]
         intro = generic_intro(paragraphs[0].text) if paragraphs else None
-        too_short = written < SCRIPT_MIN_LENGTH_RATIO * target_words
-        if violations or intro or too_short:
+        # Seule la *qualité* déclenche une reprise : la longueur du script n'est plus un critère,
+        # cinq essais mesurés ayant montré que Gemini n'obéit pas à une cible de mots.
+        if violations or intro:
             logger.warning(
-                "Recap : %d formule(s) visuelle(s) %s%s%s, regeneration",
+                "Recap : %d formule(s) visuelle(s) %s%s, regeneration",
                 len(violations), violations[:6], f" ; intro generique {intro[:60]!r}" if intro else "",
-                f" ; script trop court ({written} mots pour {target_words} vises)" if too_short else "",
             )
             problems = [f'"{v}"' for v in violations[:10]]
             if intro:
                 problems.append(f'generic opening "{intro[:80]}"')
-            if too_short:
-                problems.append(
-                    f"the script was far too short ({written} words instead of about {target_words})"
-                )
             reminder = (
                 "Your previous recap broke the rules: " + "; ".join(problems)
                 + ". Rewrite the whole recap as pure narrated storytelling without any reference to "
-                "panels, images, scenes shown or the act of seeing, and open directly with a strong hook "
-                "from the story (no greeting, no 'in this chapter'). Keep the same key panel numbers. "
-                f"This time write about {target_words} words in total, with EVERY paragraph between 35 and "
-                "90 words: narrate the events one by one instead of summarising them."
+                "panels, images, scenes shown or the act of seeing, and open inside the action with a "
+                "gesture or a quoted line (no greeting, no 'in this chapter', no pitch of the series). "
+                "Keep the same plan, the same weights and the same key panel numbers."
             )
             try:
-                retried = self.generate(
+                entries = self.generate(
                     [*contents, types.Part.from_text(text=reminder)], config, parse, "recap complet (retry)",
                 )
-                retried_words = sum(len(d.text.split()) for d, _, _ in retried)
-                # On ne garde la reprise que si elle est au moins aussi fournie que l'originale.
-                if retried_words >= written or not too_short:
-                    entries, paragraphs = retried, [draft for draft, _, _ in retried]
-                    written = retried_words
-                else:
-                    logger.warning("Reprise encore plus courte (%d mots) : on garde la premiere", retried_words)
+                paragraphs = [draft for draft, _, _ in entries]
             except AnalyzerError as exc:
                 logger.warning("Regeneration du recap impossible (%s) : nettoyage local", exc)
             if any(find_forbidden(p.text) for p in paragraphs):
@@ -1872,6 +2394,15 @@ class GeminiAnalyzer:
 
         return self._chapter_analysis(scenes, beats, panels, meta)
 
+    def _remember_characters(self, cards: Sequence[CharacterCard]) -> None:
+        """Retient la fiche rendue par le modèle, sans doublon de nom (dernière vue gagne)."""
+        merged: dict[str, CharacterCard] = {}
+        for card in cards:
+            name = card.name.strip()
+            if name:
+                merged[name.casefold()] = card
+        self._last_characters = list(merged.values())
+
     def _chapter_analysis(
         self, scenes: list[Scene], beats: list[Beat], panels: Sequence[Panel], meta: ChapterMeta | None
     ) -> ChapterAnalysis:
@@ -1886,6 +2417,7 @@ class GeminiAnalyzer:
             n_batches=self.n_calls,
             scenes=scenes,
             beats=beats,
+            characters=self._last_characters,
             prompt_tokens=self.usage[0],
             output_tokens=self.usage[1],
             thinking_tokens=self.usage[2],
@@ -1951,13 +2483,16 @@ __all__ = [
     "QUOTA_HINT",
     "BATCH_DELAY_S",
     "DEFAULT_KEYFRAME_WORKERS",
+    "DEFAULT_MAX_OUTPUT_TOKENS",
+    "TRUNCATION_RETRIES",
+    "MAX_INT_DIGITS",
+    "RUNAWAY_INT",
     "MAX_INLINE_PAYLOAD_BYTES",
-    "SCRIPT_MIN_LENGTH_RATIO",
-    "SINGLE_CALL_SYSTEM_INSTRUCTION_TEMPLATE",
-    "single_call_targets",
     "build_single_call_header",
     "build_single_call_footer",
     "parse_recap",
+    "parse_master_recap",
+    "parse_master_script",
     "normalize_recap",
     "AnalysisCheckpoint",
     "is_daily_quota_error",
@@ -1973,10 +2508,17 @@ __all__ = [
     "cta_paragraph_index",
     "enforce_script_conventions",
     "BEATS_SYSTEM_INSTRUCTION",
-    "SCRIPT_SYSTEM_INSTRUCTION_TEMPLATE",
+    "MASTER_PROMPT_TEMPLATE",
+    "INPUT_BLOCK_IMAGES",
+    "INPUT_BLOCK_BEATS",
+    "INPUT_BLOCKS",
+    "master_instruction",
+    "character_sheet",
+    "PEAK_MAX_SPAN",
     "KEYFRAMES_SYSTEM_INSTRUCTION_TEMPLATE",
     "AnalyzerError",
     "InvalidResponseError",
+    "TruncatedResponseError",
     "GeminiAnalyzer",
     "make_batches",
     "encode_panel_image",
@@ -1986,8 +2528,6 @@ __all__ = [
     "build_keyframes_header",
     "build_keyframes_footer",
     "paragraph_line",
-    "target_script_words",
-    "target_paragraphs",
     "panel_caption",
     "slice_caption",
     "coerce_emotion",
