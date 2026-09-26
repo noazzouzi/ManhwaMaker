@@ -20,6 +20,7 @@ import numpy as np
 from src.modules.toonsplit import detectors
 from src.modules.toonsplit.ai import AiJudge, AiSpecProvider, BlockSpec, JudgeVerdict, fallback_spec, make_client
 from src.modules.toonsplit.blocks import Block, row_background_stats, segment_blocks
+from src.utils import progress
 from src.modules.toonsplit.geometry import BUBBLE, FREE_TEXT, Box, iou1d
 from src.modules.toonsplit.search import POLICIES, BlockPlan, Candidate, SearchParams, plan_block, window_report
 
@@ -175,7 +176,8 @@ def analyze_strip(
     detect_fn = detect or detectors.detect_all
     blocks = segment_blocks(img, stats=row_background_stats(img))
     results: list[BlockResult] = []
-    for block in blocks:
+    for number, block in enumerate(blocks):
+        progress.step("figures", "Détection des personnages", number, len(blocks))
         crop = img[block.y0:block.y1]
         boxes = detect_fn(crop)
         if block.small and not any(b.kind in (BUBBLE, FREE_TEXT) for b in boxes):

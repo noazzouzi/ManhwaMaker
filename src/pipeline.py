@@ -88,6 +88,7 @@ from src.modules.tts_engine import (
     export_mp3,
     load_manifest,
 )
+from src.utils import progress
 from src.utils.audio_assets import DEFAULT_BGM_DIR, DEFAULT_SFX_DIR, ensure_default_bgm, ensure_default_sfx
 from src.utils.config import DEFAULT_NARRATION_LANGUAGE, DEFAULT_SITE_LANGUAGE, PROJECT_ROOT
 from src.utils.gemini_manager import GeminiManager
@@ -326,7 +327,9 @@ def stage_scrape_slice(url: str, out_dir: str | Path, options: PipelineOptions, 
         n_panels = len(load_panels_meta(out_dir))
         result.reused.append("scrape+slice")
     else:
+        progress.step("download", "Téléchargement des images")
         strip, meta = scrape_chapter(url, language=None)
+        progress.step("slice", "Découpe des cases")
         panels = slice_panels(strip, **slice_params)
         save_panels(panels, out_dir)
         # A cote de panels.json, jamais dedans : son jeu de cles est un contrat.
@@ -340,11 +343,13 @@ def stage_scrape_slice(url: str, out_dir: str | Path, options: PipelineOptions, 
     logger.info("Etape 1-2 : %d case(s) (%s)", n_panels, meta.summary())
     if options.panels == "figures":
         started = time.perf_counter()
+        progress.step("figures", "Détection des personnages")
         result.n_figures = len(ensure_figures(out_dir, options.figure_options(), force=options.force))
         _timed(result, "figures", started)
         logger.info("Etape 1-2 : %d case(s) personnage(s) detectee(s)", result.n_figures)
         if options.figure_upscale and result.n_figures:
             started = time.perf_counter()
+            progress.step("upscale", "Agrandissement des personnages")
             ensure_upscaled(out_dir, options.frame(), force=options.force)
             _timed(result, "upscale", started)
     return meta
@@ -427,6 +432,7 @@ def _claude_analysis(
         model=options.claude_model, language=options.language, cta_text=options.cta,
         known_characters=known_characters, previous_tail=previous_tail,
     )
+    progress.step("script", "Claude écrit le script")
     try:
         return writer.analyze(panels, meta)
     except AiError as exc:
@@ -453,6 +459,7 @@ def _gemini_analysis(
     # Un chapitre trop lourd est d'abord comprime davantage : le mode deux etapes prive
     # le redacteur des images et le reduit a reformuler des resumes deja aplatis.
     single_call = options.single_call and analyzer.fit_for_single_call(panels)
+    progress.step("script", "Gemini écrit le script" if options.script_ai == "gemini" else "Gemini écrit le script (repli de Claude)")
     try:
         if single_call:
             return analyzer.analyze_panels_single_call(panels, meta)
@@ -531,6 +538,7 @@ def stage_montage(
         logger.info("Musique unique (%.0f dB) : %s", options.bgm_gain_db, options.bgm_file)
     else:
         logger.info("Musique de fond desactivee")
+    progress.step("timeline", "Plan de montage")
     panels_dir, display, panels_meta = _montage_panels(analysis, out_dir, options, result)
     timeline = build_timeline(
         display, manifest, panels_meta, panels_dir=panels_dir, audio_dir=audio_dir,
@@ -547,6 +555,7 @@ def stage_montage(
 
     if options.make_capcut:
         started = time.perf_counter()
+        progress.step("capcut", "Brouillon CapCut")
         name = options.project_name or project_name_for(meta, out_dir.name)
         result.capcut_draft = build_capcut_draft(
             timeline, out_dir / "capcut", name,
@@ -569,13 +578,19 @@ def stage_montage(
         renderer = PreviewRenderer(
             timeline, dynamics=options.dynamics != "none", profile=options.profile()
         )
-        renderer.render(
-            preview_path, max_duration_s=seconds,
-            progress=lambda i, n: logger.info("Rendu apercu : %d/%d images", i, n) if i % (timeline.fps * 10) == 1 or i == n else None,
-        )
+        renderer.render(preview_path, max_duration_s=seconds, progress=_preview_progress(timeline.fps, 10))
         result.preview_mp4 = preview_path
         _timed(result, "preview", started)
     return result
+
+
+def _preview_progress(fps: int, log_every_s: int):
+    """Rappel de progression du rendu d'aperçu : journal toutes les ``log_every_s`` secondes de vidéo."""
+    def report(i: int, n: int) -> None:
+        progress.step("preview", "Rendu de l'aperçu", i, n)
+        if i % (fps * log_every_s) == 1 or i == n:
+            logger.info("Rendu apercu : %d/%d images", i, n)
+    return report
 
 
 def _montage_panels(
@@ -832,6 +847,7 @@ def build_compilation(
     folders = [Path(folder) for folder in folders]
     result = PipelineResult(out_dir=out_dir)
     started = time.perf_counter()
+    progress.step("timeline", "Assemblage des chapitres")
     timelines = [load_timeline(folder / "timeline.json") for folder in folders]
     series = next((t.series_title for t in timelines if t.series_title), "")
     label = compilation_label(folders)
@@ -854,6 +870,7 @@ def build_compilation(
     project = re.sub(r"\s+", " ", project).strip(" .")[:80] or out_dir.name
     if make_capcut:
         started = time.perf_counter()
+        progress.step("capcut", "Brouillon CapCut")
         result.capcut_draft = build_capcut_draft(merged, out_dir / "capcut", project)
         target = Path(capcut_dir) if capcut_dir else detect_capcut_drafts_dir()
         if target is not None and target.is_dir():
@@ -868,12 +885,12 @@ def build_compilation(
         label_s = f"{int(preview_seconds)}s" if preview_seconds else "full"
         preview_path = out_dir / f"preview_{label_s}.mp4"
         PreviewRenderer(merged).render(
-            preview_path, max_duration_s=preview_seconds or None,
-            progress=lambda i, n: logger.info("Rendu apercu : %d/%d images", i, n) if i % (merged.fps * 30) == 1 or i == n else None,
+            preview_path, max_duration_s=preview_seconds or None, progress=_preview_progress(merged.fps, 30),
         )
         result.preview_mp4 = preview_path
         _timed(result, "preview", started)
     if delete_chapters:
+        progress.step("cleanup", "Suppression des dossiers de chapitres")
         freed = delete_chapter_folders(folders, keep=out_dir)
         logger.info("%d dossier(s) de chapitre supprime(s), %.1f Go liberes", len(folders), freed / 1e9)
     logger.info(

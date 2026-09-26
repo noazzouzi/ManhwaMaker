@@ -31,6 +31,7 @@ from src.pipeline import (
     run_pipeline,
     slug_from_url,
 )
+from src.utils import progress
 from src.utils.config import DEFAULT_NARRATION_LANGUAGE, PROJECT_ROOT
 
 app = typer.Typer(add_completion=False, help="Auto-Manhwa Recap Generator : URL Webtoons ou Asura Scans -> projet CapCut + apercu.")
@@ -53,6 +54,13 @@ def _setup(verbose: bool) -> None:
 
 def _ascii(text: object) -> str:
     return str(text).encode("ascii", "replace").decode("ascii")
+
+
+def _fail(message: str, code: int, *, prefix: str = "FAILED: ") -> None:
+    """Affiche l'échec, le transmet au suivi de progression (Studio) et sort avec ``code``."""
+    print(_ascii(prefix + message))
+    progress.fail(message)
+    raise typer.Exit(code=code)
 
 
 def _pipeline_options(
@@ -178,6 +186,7 @@ def run(
 
 
 @app.command()
+@progress.outcome()
 def batch(
     url: Annotated[Optional[str], typer.Argument(help="URL de la serie (liste Webtoons, page de serie Asura) ou de n'importe quel episode.")] = None,
     url_list: Annotated[Optional[Path], typer.Option("--url-list", help="Fichier texte : une URL de chapitre par ligne.")] = None,
@@ -242,14 +251,14 @@ def batch(
     from src.pipeline import STAGE_RANKS
 
     _setup(verbose)
+    progress.start("batch", compile=bool(compile_video), redo=redo)
+    progress.phase("resolve")
     if redo is not None and redo not in STAGE_RANKS:
-        print(_ascii(f"FAILED: --redo doit valoir {', '.join(STAGE_RANKS)}"))
-        raise typer.Exit(code=2)
+        _fail(f"--redo doit valoir {', '.join(STAGE_RANKS)}", 2)
     try:
         urls = resolve_chapter_urls(url, start_chapter=start_chapter, end_chapter=end_chapter, url_list=url_list)
     except BatchError as exc:
-        print(_ascii(f"FAILED: {exc}"))
-        raise typer.Exit(code=2)
+        _fail(str(exc), 2)
     print(_ascii(f"{len(urls)} chapitre(s) cible(s) :"))
     for chapter_url in urls:
         print(_ascii(f"  - {chapter_url}"))
@@ -280,21 +289,22 @@ def batch(
         manager = GeminiManager(preferred_model=model, max_rpm=max_gemini_rpm)
         report = run_batch(urls, options, batch_options, manager=manager)
     except GeminiManagerError as exc:
-        print(_ascii(f"FAILED: {exc}"))
-        raise typer.Exit(code=1)
+        _fail(str(exc), 1)
     print(format_report(report))
     if report.errors and not report.results:
+        progress.fail(f"Aucun chapitre termine : {len(report.errors)} en echec. {next(iter(report.errors.values()))}")
         raise typer.Exit(code=1)
     if compile_video:
         if report.errors:
-            print(_ascii(f"Compilation non faite : {len(report.errors)} chapitre(s) en echec (relancer la meme commande)."))
-            raise typer.Exit(code=1)
+            _fail(f"Compilation non faite : {len(report.errors)} chapitre(s) en echec. Relancer : les chapitres faits sont gardes.", 1,
+                  prefix="")
         # Tous les chapitres demandes, y compris ceux deja faits lors d'un lot precedent.
         folders = [batch_options.out_root / slug_from_url(u) for u in urls]
         missing = [f.name for f in folders if not (f / "timeline.json").is_file()]
         if missing:
-            print(_ascii(f"Compilation non faite : chapitre(s) sans montage {missing} (deja compiles et supprimes ? --force pour les refaire)."))
-            raise typer.Exit(code=1)
+            _fail(f"Compilation non faite : chapitre(s) sans montage {missing} (deja compiles et supprimes ? --force pour les refaire).", 1,
+                  prefix="")
+        progress.phase("compile")
         _compile(folders, out=None, name=None, gap=0.6, preview_seconds=DEFAULT_COMPILATION_PREVIEW_S,
                  make_capcut=not no_capcut, capcut_dir=capcut_dir, delete_chapters=not keep_chapters,
                  root=batch_options.out_root)
@@ -321,8 +331,7 @@ def _compile(folders, *, out, name, gap, preview_seconds, make_capcut, capcut_di
         )
     except Exception as exc:  # noqa: BLE001 - la CLI doit afficher toute erreur
         logging.getLogger(__name__).exception("Compilation en echec")
-        print(_ascii(f"FAILED: {type(exc).__name__}: {exc}"))
-        raise typer.Exit(code=1)
+        _fail(f"Compilation en echec : {type(exc).__name__}: {exc}", 1)
     print(format_result(result))
     if delete_chapters:
         print(_ascii(f"Dossiers de chapitres supprimes ({len(chapters)}) : la compilation est autonome."))

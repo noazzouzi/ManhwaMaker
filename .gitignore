@@ -19,3 +19,6 @@ batch_status.json.tmp
 
 # Modeles ONNX exportes localement (toonsplit)
 models/
+
+# ManhwaMaker Studio : file des traitements, journaux, vignettes (etat local)
+studio_data/

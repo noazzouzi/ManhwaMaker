@@ -36,8 +36,11 @@ import json
 import logging
 import math
 import os
+import re
+import shutil
 import subprocess
 import time
+from collections import deque
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -60,12 +63,14 @@ from src.modules.preview_renderer import (
 )
 from src.modules.kdenlive_style import GRADES, MIX_KINDS, VIGNETTE, Cut, grade, motion_pattern, plan_cuts
 from src.modules.timeline_builder import KEN_BURNS_ZOOM, PUNCH_IN_S, load_timeline
+from src.utils import progress
 from src.utils.config import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["KDENLIVE_BIN", "find_melt", "clip_emotions", "render_stills", "render_vfx_loops", "write_ass", "KdenliveProject",
-           "build_project", "render"]
+           "build_project", "render", "chapter_starts", "plan_parts", "part_boundary_cuts", "slice_timeline", "mix_audio",
+           "render_in_parts", "style_sfx_events"]
 
 #: Dossier des exécutables de Kdenlive (installation winget par utilisateur).
 KDENLIVE_BIN = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "kdenlive" / "bin"
@@ -125,7 +130,8 @@ def render_stills(timeline: Timeline, out_dir: Path, emotions: Sequence[str] | N
     renderer = PreviewRenderer(timeline, show_subtitles=False)
     emotions = list(emotions) if emotions else [""] * len(timeline.clips)
     paths = []
-    for clip, emotion in zip(timeline.clips, emotions):
+    for number, (clip, emotion) in enumerate(zip(timeline.clips, emotions)):
+        progress.step("stills", "Images des cases", number, len(timeline.clips))
         recipe = f"{Path(timeline.panels_dir) / clip.file}|{emotion}|{GRADES.get(emotion)}|{VIGNETTE}|{timeline.width}x{timeline.height}"
         path = out_dir / f"{Path(clip.file).stem}_{hashlib.sha1(recipe.encode()).hexdigest()[:10]}.png"
         if not path.is_file():
@@ -149,6 +155,7 @@ def render_vfx_loops(timeline: Timeline, out_dir: Path) -> dict[tuple[str, float
     de composition des pistes à l'ouverture. La lueur est une image fixe dont l'opacité bat
     (:func:`_pulse`) ; les particules, une courte vidéo QuickTime RLE avec transparence.
     """
+    progress.step("vfx", "Calques d'effets")
     import imageio_ffmpeg
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -326,7 +333,10 @@ def _layout(doc: _Doc, timeline: Timeline, stills: list[Path], cuts: list[Cut | 
     mixes = []
     for i in range(1, len(placed)):
         prev, cur = placed[i - 1], placed[i]
-        cur.sub = prev.sub
+        # Kdenlive n'accepte sur la 2e sous-piste qu'une case qui entre par un fondu enchaîné :
+        # après une coupe franche ou un fondu au noir, retour sur la 1re (sinon il « corrige »
+        # le projet à l'ouverture : « Clip on incorrect subtrack found and fixed »).
+        cur.sub = 0
         cut = cuts[i - 1]
         if cut is None:
             continue
@@ -459,13 +469,19 @@ class KdenliveProject:
 
 def build_project(
     timeline: Timeline, out_dir: Path, *, name: str = "montage", emotions: Sequence[str] | None = None,
-    chapter_starts: frozenset[int] = frozenset(),
+    chapter_starts: frozenset[int] = frozenset(), cuts: Sequence[Cut | None] | None = None,
+    edges: tuple[Cut | None, Cut | None] = (None, None), audio: bool = True, assets_dir: Path | None = None,
 ) -> KdenliveProject:
     """Écrit ``<name>.kdenlive`` (Kdenlive) et ``render.mlt`` (melt) dans ``out_dir``.
 
     Args:
         emotions: émotion de la scène de chaque case (défaut : :func:`clip_emotions`).
         chapter_starts: rangs des cases qui ouvrent un chapitre (compilation).
+        cuts: transitions déjà choisies (défaut : :func:`plan_cuts`).
+        edges: transition qui précède la première case et suit la dernière (partie d'un rendu
+            découpé : fondu au noir partagé avec la partie voisine).
+        audio: pistes son (sans : partie vidéo d'un rendu découpé, le son est mixé à part).
+        assets_dir: dossier des images et calques, partagé entre les parties d'un rendu.
     """
     # Chemins absolus : Kdenlive plante sur un projet dont les médias sont en chemin relatif.
     out_dir = Path(out_dir).resolve()
@@ -475,8 +491,9 @@ def build_project(
     total = doc.frames(timeline.total_duration_s)
     emotions = list(emotions) if emotions else clip_emotions(timeline)
     clips = timeline.clips
-    cuts = plan_cuts(clips, emotions, chapter_starts=chapter_starts)
-    stills = render_stills(timeline, out_dir / "stills", emotions)
+    cuts = plan_cuts(clips, emotions, chapter_starts=chapter_starts) if cuts is None else list(cuts)
+    assets_dir = Path(assets_dir).resolve() if assets_dir else out_dir
+    stills = render_stills(timeline, assets_dir / "stills", emotions)
     ass, fonts_dir = write_ass(timeline, out_dir / f"{name}.kdenlive.ass")
 
     # Piste noire de fond (convention Kdenlive), puis pistes audio (du bas vers A1), puis vidéo.
@@ -485,8 +502,16 @@ def build_project(
            mlt_image_format="rgba", set__test_audio=0)
 
     audio_tracks = []
-    # Bruitages : ceux de la timeline, plus le « swoosh » des changements de scène rapides et
-    # l'impact des punch-in qui n'en ont pas. Deux pistes : un bruitage long n'en masque aucun.
+    if audio:
+        _audio_tracks(doc, timeline, cuts, total, audio_tracks)
+    return _finish_project(doc, timeline, out_dir, name, cuts, edges, stills, ass, fonts_dir, black, audio_tracks,
+                           assets_dir, total)
+
+
+def style_sfx_events(timeline: Timeline, cuts: Sequence[Cut | None]) -> list[tuple[float, Path, float]]:
+    """Bruitages du rendu : ceux de la timeline, plus le « swoosh » des changements de scène
+    rapides et l'impact des punch-in qui n'en ont pas. ``(début, fichier, gain dB)``."""
+    clips = timeline.clips
     events = [(s.start_s, Path(s.file), s.gain_db) for s in timeline.sfx]
     for i, cut in enumerate(cuts):
         if cut is not None and cut.scene_change and cut.kind in ("whip", "push") and SWOOSH_FILE.is_file():
@@ -494,6 +519,14 @@ def build_project(
     for clip in clips:
         if clip.motion == "punch_in" and IMPACT_FILE.is_file() and all(abs(t - clip.start_s) > 0.4 for t, _, _ in events):
             events.append((clip.start_s, IMPACT_FILE, IMPACT_GAIN_DB))
+    return events
+
+
+def _audio_tracks(doc: _Doc, timeline: Timeline, cuts: Sequence[Cut | None], total: int, audio_tracks: list) -> None:
+    """Pistes son : deux de bruitages, deux de musique (fondus entre ambiances), la voix off."""
+    fps = timeline.fps
+    events = style_sfx_events(timeline, cuts)
+    # Deux pistes de bruitages : un bruitage long n'en masque aucun.
     sfx_pls = [[_playlist(doc, True), _playlist(doc, True)], [_playlist(doc, True), _playlist(doc, True)]]
     sfx_cursors = [_Cursor(sfx_pls[0][0]), _Cursor(sfx_pls[1][0])]
     for start_s, path, gain_db in sorted(events, key=lambda e: e[0]):
@@ -536,10 +569,19 @@ def build_project(
             cursor.add(doc.producer(path, image=False, length=max(length, _audio_length(path, fps))), start, length)
     audio_tracks.append(_track(doc, voice_pl, audio=True))
 
+
+def _finish_project(
+    doc: _Doc, timeline: Timeline, out_dir: Path, name: str, cuts: list[Cut | None], edges: tuple[Cut | None, Cut | None],
+    stills: list[Path], ass: Path, fonts_dir: Path, black: ET.Element, audio_tracks: list, assets_dir: Path, total: int,
+) -> KdenliveProject:
+    """Pistes vidéo (cases, calques d'effets, flashs), piste principale, puis les deux fichiers."""
+    fps, width, height = timeline.fps, timeline.width, timeline.height
     # Vidéo : une image par case, deux sous-pistes pour les fondus enchaînés.
     video_pl = [_playlist(doc, False), _playlist(doc, False)]
     cursors = [_Cursor(video_pl[0]), _Cursor(video_pl[1])]
     placed, mixes = _layout(doc, timeline, stills, cuts)
+    if placed:  # bords d'une partie de rendu : fondu au noir partagé avec la voisine
+        placed[0].cut_in, placed[-1].cut_out = edges
     flashes: list[tuple[int, int, str]] = []  # (début, durée, « dip » ou « impact »)
     for index, item in enumerate(placed):
         length = item.end - item.start
@@ -560,7 +602,7 @@ def build_project(
     for mix in mixes:
         _mix(video, doc, mix)
     video_tracks = [video]
-    loops = render_vfx_loops(timeline, out_dir / "vfx")
+    loops = render_vfx_loops(timeline, assets_dir / "vfx")
     if loops:  # piste V2 : calques d'effets transparents, en boucle
         vfx_pl = [_playlist(doc, False), _playlist(doc, False)]
         cursor = _Cursor(vfx_pl[0])
@@ -636,31 +678,319 @@ def build_project(
     return KdenliveProject(project, render_mlt, ass, stills, total)
 
 
+#: Ligne de progression de ``melt -progress2`` : ``Current Frame: 88, percentage: 97``.
+MELT_PROGRESS = re.compile(r"Current Frame:\s*(\d+),\s*percentage:\s*(\d+)")
+VIDEO_CODECS = {
+    "h264_amf": ["vcodec=h264_amf", "rc=cqp", "qp_i=20", "qp_p=22", "qp_b=24", "quality=balanced"],
+    "libx264": ["vcodec=libx264", "crf=20", "preset=veryfast"],
+}
+#: Rendu par parties (26/09). Sur une compilation de 2 h 20 (1 115 cases), melt passait 73 s à
+#: charger le projet puis 30 ms par image contre 15 sur un chapitre, et l'encodeur AMD a manqué
+#: de mémoire à mi-parcours (``AllocSurface() failed with error 6``) : 69 min perdues et un MP4
+#: illisible. Au-delà de :data:`PARTS_FROM_S`, chaque partie (un chapitre de compilation, sinon
+#: une suite de scènes d'environ :data:`PART_TARGET_S`) devient un petit projet vidéo rendu par
+#: son propre melt ; le son est mixé une fois pour toute la vidéo ; ffmpeg assemble sans
+#: réencoder l'image. Une partie finie est gardée : un rendu interrompu reprend où il s'était arrêté.
+PARTS_FROM_S = 720.0
+PART_TARGET_S = 360.0
+AUDIO_RATE = 48_000
+#: Change quand le découpage ou le rendu des parties change (les parties déjà rendues sont alors refaites).
+PARTS_VERSION = 1
+
+
+def _run_melt(mlt: Path, out: Path, *, vcodec: str, frames: int, threads: int = 0, audio: bool = True,
+              out_frame: int | None = None, done_before: int = 0, total: int | None = None,
+              label: str = "Rendu de la vidéo") -> None:
+    """Un passage de melt, avancement relayé à :mod:`src.utils.progress` (``done_before`` + image courante)."""
+    threads = threads or os.cpu_count() or 4
+    total = total or frames
+    cmd = [str(find_melt()), str(mlt)]
+    if out_frame is not None:
+        cmd.append(f"out={out_frame}")
+    cmd += ["-consumer", f"avformat:{out}", f"real_time=-{threads}", "f=mp4", *VIDEO_CODECS[vcodec], "pix_fmt=yuv420p"]
+    cmd += ["acodec=aac", "ab=192k", "ar=48000", "channels=2"] if audio else ["an=1"]
+    cmd += ["movflags=+faststart", "-progress2"]
+    tail: deque[str] = deque(maxlen=30)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+    assert proc.stderr is not None
+    last_logged = -10
+    for line in proc.stderr:
+        match = MELT_PROGRESS.search(line)
+        if match is None:
+            if line.strip():
+                tail.append(line.rstrip())
+            continue
+        done = done_before + int(match.group(1))
+        progress.step("melt", label, done, total)
+        percent = 100 * done // max(1, total)
+        if percent >= last_logged + 10:
+            last_logged = percent - percent % 10
+            logger.info("Rendu melt : %d %% (%d/%d images)", percent, done, total)
+    returncode = proc.wait()
+    if returncode != 0 or not out.is_file():
+        raise RuntimeError(f"melt en echec ({returncode}) : {chr(10).join(tail)[-800:]}")
+
+
 def render(project: KdenliveProject, out: Path, *, vcodec: str = "h264_amf", threads: int = 0,
            seconds: float | None = None, fps: int = 60) -> float:
-    """Rend ``render.mlt`` avec melt ; renvoie la durée du rendu (s)."""
-    threads = threads or os.cpu_count() or 4
-    codec = (["vcodec=h264_amf", "rc=cqp", "qp_i=20", "qp_p=22", "qp_b=24", "quality=balanced"]
-             if vcodec == "h264_amf" else ["vcodec=libx264", "crf=20", "preset=veryfast"])
-    cmd = [str(find_melt()), str(project.render_mlt)]
-    if seconds:
-        cmd += ["out=" + str(round(seconds * fps) - 1)]
-    cmd += ["-consumer", f"avformat:{out}", f"real_time=-{threads}", "f=mp4", *codec, "pix_fmt=yuv420p",
-            "acodec=aac", "ab=192k", "ar=48000", "channels=2", "movflags=+faststart", "-silent"]
+    """Rend ``render.mlt`` en un seul passage de melt ; renvoie la durée du rendu (s).
+
+    Le fichier n'apparaît sous son nom qu'une fois complet : un rendu interrompu ne laisse
+    jamais un MP4 illisible à la place de la vidéo.
+    """
+    frames = min(project.frames, round(seconds * fps)) if seconds else project.frames
+    tmp = out.with_name(out.stem + ".part.mp4")
     started = time.perf_counter()
+    _run_melt(project.render_mlt, tmp, vcodec=vcodec, frames=frames, threads=threads,
+              out_frame=frames - 1 if seconds else None)
+    os.replace(tmp, out)
+    progress.step("melt", "Rendu de la vidéo", frames, frames)
+    return time.perf_counter() - started
+
+
+# --- Rendu par parties --------------------------------------------------------------------
+def chapter_starts(timeline: Timeline) -> frozenset[int]:
+    """Rangs des cases qui ouvrent un chapitre d'une compilation (préfixe ``<serie>_epN__`` des fichiers)."""
+    prefixes = [Path(c.file).name.split("__", 1)[0] if "__" in Path(c.file).name else None for c in timeline.clips]
+    if not any(prefixes):
+        return frozenset()
+    return frozenset(i for i in range(1, len(prefixes)) if prefixes[i] != prefixes[i - 1])
+
+
+def plan_parts(timeline: Timeline, *, chapters: frozenset[int] = frozenset(), target_s: float = PART_TARGET_S,
+               from_s: float = PARTS_FROM_S) -> list[int]:
+    """Première case de chaque partie du rendu (``[0]`` : une seule partie).
+
+    On coupe à un début de chapitre (compilation), sinon à un changement de scène, dès que la
+    partie en cours atteint ``target_s`` ; jamais pour laisser une dernière partie minuscule.
+    """
+    clips = timeline.clips
+    if timeline.total_duration_s <= from_s or len(clips) < 2:
+        return [0]
+    starts = [0]
+    for i in range(1, len(clips)):
+        boundary = i in chapters if chapters else clips[i].scene_index != clips[i - 1].scene_index
+        if (boundary and clips[i].start_s - clips[starts[-1]].start_s >= target_s
+                and timeline.total_duration_s - clips[i].start_s >= 0.3 * target_s):
+            starts.append(i)
+    return starts
+
+
+def part_boundary_cuts(cuts: Sequence[Cut | None], starts: Sequence[int]) -> list[Cut | None]:
+    """Coupes aux frontières des parties : un fondu enchaîné y devient un fondu au noir.
+
+    Un fondu enchaîné mêle deux cases pendant la transition : il ne peut pas être coupé en deux
+    rendus. Le fondu au noir, lui, est un effet sur chaque case (fin de l'une, début de
+    l'autre) : chaque partie en rend sa moitié. Le fondu au blanc aussi, pour la même raison.
+    """
+    out = list(cuts)
+    for i in starts[1:]:
+        cut = out[i - 1]
+        if cut is not None and (cut.kind in MIX_KINDS or cut.kind == "dip_white"):
+            out[i - 1] = Cut("dip_black", cut.duration_s, "", cut.scene_change)
+    return out
+
+
+def slice_timeline(timeline: Timeline, i0: int, i1: int, *, end_s: float | None = None, keep_audio: bool = False) -> Timeline:
+    """Cases ``i0`` à ``i1 - 1`` (jusqu'à ``end_s`` au plus), en temps remis à zéro, à l'image près.
+
+    Sans ``keep_audio`` : partie vidéo d'un rendu découpé (le son est mixé pour toute la vidéo).
+    """
+    fps, clips = timeline.fps, timeline.clips
+    t0 = round(clips[i0].start_s * fps) / fps
+    if end_s is not None:
+        t1 = round(end_s * fps) / fps
+    else:
+        t1 = round((clips[i1].start_s if i1 < len(clips) else timeline.total_duration_s) * fps) / fps
+    length = t1 - t0
+    kept = [c for c in clips[i0:i1] if c.start_s < t1]
+    part_clips = []
+    for k, clip in enumerate(kept):
+        start = clip.start_s - t0
+        duration = (length - start) if k == len(kept) - 1 else clip.duration_s
+        part_clips.append(clip.model_copy(update={"start_s": start, "duration_s": duration}))
+
+    def window(items, *, end_attr: str = "duration"):
+        out = []
+        for item in items:
+            end = item.end_s
+            if end <= t0 or item.start_s >= t1:
+                continue
+            start, stop = max(item.start_s, t0) - t0, min(end, t1) - t0
+            update = {"start_s": start, "end_s": stop} if end_attr == "end" else {"start_s": start, "duration_s": stop - start}
+            out.append(item.model_copy(update=update))
+        return out
+
+    update: dict = {"clips": part_clips, "subtitles": window(timeline.subtitles, end_attr="end"), "vfx": window(timeline.vfx),
+                    "total_duration_s": length}
+    if keep_audio:
+        if t0 > 0:
+            raise ValueError("le son ne se découpe qu'à partir du début")
+        update.update(audio=window(timeline.audio), bgm=window(timeline.bgm),
+                      sfx=[s for s in timeline.sfx if s.start_s < t1])
+    else:
+        update.update(audio=[], bgm=[], sfx=[], bgm_file=None)
+    return timeline.model_copy(update=update)
+
+
+def mix_audio(timeline: Timeline, cuts: Sequence[Cut | None], out_wav: Path, *, rate: int = AUDIO_RATE,
+              window_s: float = 60.0) -> Path:
+    """Son de toute la vidéo en un WAV mono : voix, musique bouclée avec ses fondus, bruitages.
+
+    Mixé par fenêtres de ``window_s`` (mémoire bornée, même pour 2 h 20), à l'échantillon près :
+    les parties vidéo s'y calent exactement. Mêmes sons que les pistes du projet Kdenlive
+    (:func:`style_sfx_events`), fondus linéaires comme l'aperçu.
+    """
+    from src.modules.preview_renderer import _read_mono
+
+    total = round(timeline.total_duration_s * timeline.fps) * rate // timeline.fps
+    # Sources : (début, durée, fichier, gain linéaire, boucle, fondu d'entrée, fondu de sortie) en échantillons.
+    sources: list[tuple[int, int, Path, float, bool, int, int]] = []
+    for clip in timeline.audio:
+        sources.append((round(clip.start_s * rate), round(clip.duration_s * rate), Path(timeline.audio_dir) / clip.file,
+                        1.0, False, 0, 0))
+    bgm = list(timeline.bgm)
+    if not bgm and timeline.bgm_file:
+        sources.append((0, total, Path(timeline.bgm_file), 10 ** (timeline.bgm_gain_db / 20), True, 0, 0))
+    for seg in bgm:
+        sources.append((round(seg.start_s * rate), round(seg.duration_s * rate), Path(seg.file), 10 ** (seg.gain_db / 20), True,
+                        round(seg.fade_in_s * rate), round(seg.fade_out_s * rate)))
+    for start_s, path, gain_db in style_sfx_events(timeline, cuts):
+        if path.is_file():  # durée lue sans décoder : on sait d'avance si le bruitage touche une fenêtre
+            info = sf.info(str(path))
+            sources.append((round(start_s * rate), round(info.frames / info.samplerate * rate), path, 10 ** (gain_db / 20),
+                            False, 0, 0))
+    sources.sort(key=lambda src: src[0])
+    cache: dict[Path, np.ndarray] = {}
+    step = round(window_s * rate)
+    n_windows = max(1, -(-total // step))
+    tmp = out_wav.with_name(out_wav.stem + ".part.wav")
+    with sf.SoundFile(str(tmp), "w", samplerate=rate, channels=1, subtype="PCM_16", format="WAV") as out:
+        for w, w0 in enumerate(range(0, total, step)):
+            progress.step("audio", "Mixage du son", w, n_windows)
+            w1 = min(total, w0 + step)
+            buf = np.zeros(w1 - w0, dtype=np.float32)
+            active = set()
+            for start, length, path, gain, loop, fade_in, fade_out in sources:
+                if start >= w1:
+                    break
+                if start + length <= w0 or length <= 0:
+                    continue
+                if path not in cache:
+                    if not path.is_file():
+                        logger.warning("Son introuvable, ignore : %s", path)
+                        cache[path] = np.zeros(0, dtype=np.float32)
+                    else:
+                        cache[path] = _read_mono(path, rate)
+                data = cache[path]
+                if not len(data):
+                    continue
+                active.add(path)
+                a, b = max(w0, start), min(w1, start + length)
+                rel = np.arange(a - start, b - start)
+                if not loop:
+                    rel = rel[rel < len(data)]
+                    b = a + len(rel)
+                    if not len(rel):
+                        continue
+                samples = data[rel % len(data)] * gain
+                if fade_in > 0:
+                    samples = samples * np.minimum(1.0, rel / fade_in).astype(np.float32)
+                if fade_out > 0:
+                    samples = samples * np.minimum(1.0, (length - rel) / fade_out).astype(np.float32)
+                buf[a - w0:b - w0] += samples
+            out.write(np.clip(buf, -1.0, 1.0))
+            for path in [p for p in cache if p not in active and p.parent != SWOOSH_FILE.parent]:
+                del cache[path]  # voix passées : la mémoire reste bornée
+    os.replace(tmp, out_wav)
+    progress.step("audio", "Mixage du son", n_windows, n_windows)
+    return out_wav
+
+
+def _ffmpeg() -> str:
+    exe = KDENLIVE_BIN / "ffmpeg.exe"
+    if exe.is_file():
+        return str(exe)
+    import imageio_ffmpeg
+
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def _concat_line(path: Path) -> str:
+    quoted = path.resolve().as_posix().replace("'", "'\\''")
+    return f"file '{quoted}'\n"
+
+
+def _mux(parts: Sequence[Path], wav: Path, out: Path) -> None:
+    """Assemble les parties vidéo (sans réencodage) et le son (AAC) en un MP4 lisible dès le début."""
+    listing = parts[0].parent / "parts.txt"
+    listing.write_text("".join(_concat_line(p) for p in parts), encoding="utf-8")
+    tmp = out.with_name(out.stem + ".part.mp4")
+    cmd = [_ffmpeg(), "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(listing), "-i", str(wav),
+           "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+           "-movflags", "+faststart", "-f", "mp4", str(tmp)]
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    elapsed = time.perf_counter() - started
-    if proc.returncode != 0 or not out.is_file():
-        raise RuntimeError(f"melt en echec ({proc.returncode}) : {(proc.stderr or proc.stdout)[-800:]}")
-    return elapsed
+    if proc.returncode != 0 or not tmp.is_file():
+        raise RuntimeError(f"assemblage ffmpeg en echec ({proc.returncode}) : {(proc.stderr or '')[-800:]}")
+    os.replace(tmp, out)
 
 
+def render_in_parts(timeline: Timeline, out_dir: Path, out: Path, *, cuts: Sequence[Cut | None], emotions: Sequence[str],
+                    starts: Sequence[int], vcodec: str = "h264_amf", threads: int = 0) -> float:
+    """Rend la vidéo partie par partie (un melt chacune), mixe le son, assemble ; renvoie la durée (s).
+
+    Les parties finies restent dans ``render_parts/<empreinte>/`` tant que la vidéo n'est pas
+    assemblée : relancer le même rendu reprend à la première partie manquante.
+    """
+    out_dir = Path(out_dir).resolve()
+    fps = timeline.fps
+    total = round(timeline.total_duration_s * fps)
+    signature = json.dumps([PARTS_VERSION, vcodec, list(starts), [c.__dict__ if c else None for c in cuts], list(emotions),
+                            timeline.model_dump(mode="json")], sort_keys=True, default=str)
+    parts_dir = out_dir / "render_parts" / f"{vcodec}_{fps}fps_{hashlib.sha1(signature.encode()).hexdigest()[:12]}"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+    parts: list[Path] = []
+    done = 0
+    n_parts = len(starts)
+    for k, i0 in enumerate(starts):
+        i1 = starts[k + 1] if k + 1 < n_parts else len(timeline.clips)
+        part = slice_timeline(timeline, i0, i1)
+        frames = round(part.total_duration_s * fps)
+        target = parts_dir / f"part_{k:03d}.mp4"
+        parts.append(target)
+        label = f"Rendu de la vidéo · partie {k + 1}/{n_parts}"
+        if target.is_file():
+            done += frames
+            progress.step("melt", label, done, total)
+            logger.info("Partie %d/%d deja rendue : reprise", k + 1, n_parts)
+            continue
+        work = parts_dir / f"part_{k:03d}"
+        edges = (cuts[i0 - 1] if i0 > 0 else None, cuts[i1 - 1] if i1 < len(timeline.clips) else None)
+        project = build_project(part, work, name=f"part_{k:03d}", emotions=emotions[i0:i1], cuts=cuts[i0:i1 - 1],
+                                edges=edges, audio=False, assets_dir=out_dir)
+        tmp = parts_dir / f"part_{k:03d}.part.mp4"
+        _run_melt(project.render_mlt, tmp, vcodec=vcodec, frames=frames, threads=threads, audio=False,
+                  done_before=done, total=total, label=label)
+        os.replace(tmp, target)
+        shutil.rmtree(work, ignore_errors=True)
+        done += frames
+    wav = parts_dir / "audio.wav"
+    if not wav.is_file():
+        mix_audio(timeline, cuts, wav)
+    progress.step("mux", "Assemblage final")
+    _mux(parts, wav, out)
+    shutil.rmtree(parts_dir, ignore_errors=True)  # les parties doublaient la taille de la vidéo
+    return time.perf_counter() - started
+
+
+@progress.outcome()
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Projet Kdenlive + rendu melt d'un chapitre (essai)")
-    parser.add_argument("chapter", type=Path, help="dossier du chapitre (contient timeline.json)")
+    parser = argparse.ArgumentParser(description="Projet Kdenlive + rendu melt d'un chapitre ou d'une compilation")
+    parser.add_argument("chapter", type=Path, help="dossier du chapitre ou de la compilation (contient timeline.json)")
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--seconds", type=float, default=None, help="ne rendre que le début")
-    parser.add_argument("--codec", default="h264_amf", choices=["h264_amf", "libx264"])
+    parser.add_argument("--codec", default="h264_amf", choices=list(VIDEO_CODECS))
     parser.add_argument("--fps", type=int, default=None, help="images par seconde (defaut : celles de la timeline)")
     parser.add_argument("--no-render", action="store_true")
     args = parser.parse_args()
@@ -668,16 +998,35 @@ def main() -> None:
     timeline = load_timeline(args.chapter / "timeline.json")
     if args.fps:
         timeline = timeline.model_copy(update={"fps": args.fps})
-    out_dir = args.out or args.chapter / "kdenlive"
+    out_dir = (args.out or args.chapter / "kdenlive").resolve()
+    video_s = min(args.seconds, timeline.total_duration_s) if args.seconds else timeline.total_duration_s
+    emotions = clip_emotions(timeline, args.chapter)
+    chapters = chapter_starts(timeline)
+    cuts = plan_cuts(timeline.clips, emotions, chapter_starts=chapters)
+    # Ce qui est rendu (extrait compris), découpé en parties au-delà de 12 min.
+    shown = timeline
+    if args.seconds and args.seconds < timeline.total_duration_s:
+        n = sum(1 for c in timeline.clips if c.start_s < args.seconds)
+        shown = slice_timeline(timeline, 0, n, end_s=args.seconds, keep_audio=True)
+    starts = plan_parts(shown, chapters=frozenset(i for i in chapters if i < len(shown.clips)))
+    cuts = part_boundary_cuts(cuts, starts)
+    progress.start("render", chapter=str(args.chapter), fps=timeline.fps, codec=args.codec, video_s=round(video_s, 1),
+                   parts=len(starts))
+    progress.phase("project")
     started = time.perf_counter()
-    project = build_project(timeline, out_dir, name=args.chapter.name, emotions=clip_emotions(timeline, args.chapter))
+    project = build_project(timeline, out_dir, name=args.chapter.name, emotions=emotions, cuts=cuts)
     logger.info("Projet ecrit en %.1fs", time.perf_counter() - started)
     if args.no_render:
         return
     suffix = (f"_{int(args.seconds)}s" if args.seconds else "") + f"_{timeline.fps}fps"
     out = out_dir / f"melt_{args.codec}{suffix}.mp4"
-    elapsed = render(project, out, vcodec=args.codec, seconds=args.seconds, fps=timeline.fps)
-    video_s = (args.seconds or timeline.total_duration_s)
+    progress.phase("render", output=str(out))
+    if len(starts) == 1:
+        elapsed = render(project, out, vcodec=args.codec, seconds=args.seconds, fps=timeline.fps)
+    else:
+        logger.info("Rendu en %d parties (%.0f s de video)", len(starts), video_s)
+        elapsed = render_in_parts(shown, out_dir, out, cuts=cuts[:max(0, len(shown.clips) - 1)],
+                                  emotions=emotions[:len(shown.clips)], starts=starts, vcodec=args.codec)
     logger.info("Rendu melt (%s) : %.1fs pour %.1fs de video (x%.2f temps reel) -> %s", args.codec, elapsed, video_s,
                 video_s / elapsed, out)
 

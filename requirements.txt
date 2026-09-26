@@ -30,5 +30,9 @@ huggingface_hub>=0.24  # téléchargement des modèles (déjà tiré par kokoro/
 typer>=0.12
 pydantic>=2.6
 
+# --- ManhwaMaker Studio (interface web locale, python -m src.studio) ---
+fastapi>=0.115
+uvicorn>=0.30
+
 # --- Dev / tests (optionnel) ---
 pytest>=8.0

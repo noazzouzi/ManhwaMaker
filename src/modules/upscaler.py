@@ -46,6 +46,7 @@ import cv2
 import numpy as np
 
 from src.modules.figure_panels import FIGURES_DIRNAME
+from src.utils import progress
 
 logger = logging.getLogger(__name__)
 
@@ -294,8 +295,12 @@ def ensure_upscaled(
         out.update(width=int(image.shape[1]), height=int(image.shape[0]), upscale=round(image.shape[0] / height, 3))
         return out
 
+    written: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=IO_WORKERS) as pool:
-        written = list(pool.map(process, entries))
+        # Résultats relus dans ce thread : c'est lui qui porte le chapitre suivi (progress.bind).
+        for entry in pool.map(process, entries):
+            written.append(entry)
+            progress.step("upscale", "Agrandissement des personnages", len(written), len(entries))
     keep = {str(entry["file"]) for entry in written}
     stale = re.compile(r"^panel_\d{3,}\.png$")
     for path in dst.iterdir():

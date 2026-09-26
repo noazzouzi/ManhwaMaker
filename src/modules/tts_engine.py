@@ -45,6 +45,7 @@ import soundfile as sf
 
 from src.models.audio import SceneAudio, VoiceoverManifest
 from src.models.scene import ChapterAnalysis, Scene
+from src.utils import progress
 from src.utils.config import DEFAULT_NARRATION_LANGUAGE, PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
@@ -531,9 +532,11 @@ class KokoroTTS:
             len(scenes), self.voice, self.lang_code, self.speed, self.padding_s, self.sentence_gap_s,
         )
         items: list[SceneAudio] = []
-        for scene in scenes:
+        for number, scene in enumerate(scenes):
+            progress.step("voice", "Synthèse de la voix", number, len(scenes))
             path = out_dir / f"{prefix}_{scene.index:03d}.wav"
             items.append(self.synthesize_scene(scene, path))
+        progress.step("voice", "Synthèse de la voix", len(scenes), len(scenes))
 
         manifest = VoiceoverManifest(
             language=self.language,

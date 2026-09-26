@@ -33,7 +33,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
 import numpy as np
@@ -44,6 +44,7 @@ from PIL import Image, UnidentifiedImageError
 
 from src.models.chapter import ChapterMeta
 from src.modules import asura
+from src.utils import progress
 from src.utils.config import DEFAULT_SITE_LANGUAGE
 from src.utils.http import ensure_mandatory_headers, get_with_retry
 
@@ -228,7 +229,7 @@ def discover_episodes(
         page_url = asura.series_url(url)
         with _session_scope(session) as http:
             response = get_with_retry(http, page_url, **_site_kwargs(page_url))
-        chapters = asura.parse_chapter_links(response.text, page_url)
+        chapters = asura.parse_chapter_links(html_text(response), page_url)
         logger.info("%d chapitre(s) trouve(s) pour %s", len(chapters), page_url)
         return dict(sorted(chapters.items()))
     list_url = series_list_url(normalize_webtoon_url(url, language))
@@ -237,7 +238,7 @@ def discover_episodes(
         for page in range(1, max_pages + 1):
             page_url = f"{list_url}&page={page}" if page > 1 else list_url
             response = get_with_retry(http, page_url)
-            links = parse_episode_links(response.text, page_url)
+            links = parse_episode_links(html_text(response), page_url)
             new = {no: link for no, link in links.items() if no not in episodes}
             if not new:
                 break
@@ -470,7 +471,7 @@ def fetch_chapter_image_urls(
         final_url = str(getattr(response, "url", "") or url)
         if final_url != url:
             logger.info("Redirige vers: %s", final_url)
-        html = response.text
+        html = html_text(response)
 
     parse = asura.parse_chapter_html if on_asura else parse_chapter_html
     meta = parse(html, url=url, final_url=final_url)
@@ -481,6 +482,22 @@ def fetch_chapter_image_urls(
             "(selecteurs testes: " + ", ".join(selectors) + ")"
         )
     return meta
+
+
+def html_text(response: Any) -> str:
+    """Page HTML décodée. Sans encodage annoncé par le serveur, UTF-8 d'abord.
+
+    ``requests`` suppose alors Latin-1 (RFC 2616) : Asura Scans ne l'annonce pas, et le titre
+    « Genius Archer’s Streaming » devenait « Genius Archerâs Streaming » (26/09).
+    """
+    content_type = str((getattr(response, "headers", None) or {}).get("content-type", "")).lower()
+    content = getattr(response, "content", None)
+    if content and "charset=" not in content_type:
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+    return response.text
 
 
 def _to_rgb(img: Image.Image) -> Image.Image:
@@ -548,6 +565,7 @@ def download_images(
             if index > 0 and delay > 0:
                 _sleep(delay)
             logger.info("Image %d/%d: %s", index + 1, total, url)
+            progress.step("download", "Téléchargement des images", index, total)
             response = get_with_retry(http, url, max_retries=max_retries, **extra)
             img = _decode_image(response.content, url)
             logger.debug(

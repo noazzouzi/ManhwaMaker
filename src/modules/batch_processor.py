@@ -48,6 +48,7 @@ from src.pipeline import (
     stage_scrape_slice,
     stage_tts,
 )
+from src.utils import progress
 from src.utils.config import PROJECT_ROOT
 from src.utils.gemini_manager import GeminiManager, QuotaExhaustedError
 
@@ -391,11 +392,15 @@ async def process_batch(
             )
 
     async def one(url: str) -> None:
+        # Les etapes lancees par asyncio.to_thread heritent de ce lien : le pipeline rapporte
+        # sa progression sans savoir quel chapitre il traite.
+        progress.bind(url)
         out_dir = batch.out_root / slug_from_url(url)
         entry = status.get(url)
         if not status.should_process(url, retry_failed=batch.retry_failed, force=options.force or bool(options.redo)):
             report.skipped.append(url)
             logger.info("Chapitre deja %s, ignore : %s", entry["status"], url)
+            progress.finish("skipped", out_dir=str(out_dir), title=entry.get("title"))
             analyzed[url].set()  # un chapitre ignore ne doit bloquer personne
             return
         result = PipelineResult(out_dir=out_dir)
@@ -403,6 +408,7 @@ async def process_batch(
             url, STATUS_PROCESSING, stage="scrape", out_dir=str(out_dir), started=_now(), finished=None, error=None,
             attempts=int(entry.get("attempts", 0)) + 1,
         )
+        progress.item(out_dir=str(out_dir))
         t0 = time.perf_counter()
         # Quota Gemini epuise : seuls les lots ecrits par Gemini s'arretent. Claude ecrit sans
         # quota Gemini ; Gemini n'y sert que de repli.
@@ -411,25 +417,40 @@ async def process_batch(
             if gemini_only and quota_hit.is_set():
                 raise QuotaExhaustedError("quota Gemini epuise sur toutes les cles et tous les modeles (chapitre precedent)")
             # Le scraping (reseau) avance pendant que d'autres chapitres consomment le quota Gemini.
+            progress.stage("prep", "waiting", reason="slot")
             async with sem_scrape:
+                progress.stage("prep")
                 meta = await asyncio.to_thread(stages.scrape, url, out_dir, options, result)
             status.update(
                 url, stage="analyze", episode_no=meta.episode_no, title=f"{meta.series_title} - {meta.episode_title}".strip(" -"),
                 n_panels=result.n_panels,
             )
+            progress.item(episode_no=meta.episode_no, title=f"{meta.series_title} - {meta.episode_title}".strip(" -"),
+                          n_panels=result.n_panels)
+            if url in predecessors and not analyzed[predecessors[url]].is_set():
+                progress.stage("script", "waiting", reason="previous", after=predecessors[url])
             await wait_for_predecessor(url)
+            progress.stage("script", "waiting", reason="slot")
             async with sem_chapters:
                 if gemini_only and quota_hit.is_set():
                     raise QuotaExhaustedError("quota Gemini epuise sur toutes les cles et tous les modeles (chapitre precedent)")
+                progress.stage("script")
                 analysis = await asyncio.to_thread(stages.analyze, meta, out_dir, options, result, manager=manager)
             analyzed[url].set()  # la fiche est ecrite : le chapitre suivant peut demarrer
             status.update(url, stage="tts", model=analysis.model, n_scenes=analysis.n_scenes)
+            progress.item(model=analysis.model, n_scenes=analysis.n_scenes)
+            progress.stage("voice", "waiting", reason="slot")
             async with sem_tts:
+                progress.stage("voice")
                 manifest = await asyncio.to_thread(stages.tts, analysis, out_dir, options, result)
             status.update(url, stage="montage", voice_s=round(manifest.total_duration_s, 1))
+            progress.stage("montage", "waiting", reason="slot")
             async with sem_render:
+                progress.stage("montage")
                 result = await asyncio.to_thread(stages.montage, analysis, manifest, meta, out_dir, options, result)
             report.results[url] = result
+            progress.finish("done", video_s=round(result.total_duration_s, 1),
+                            timings={step: round(seconds, 1) for step, seconds in result.timings.items()})
             status.update(
                 url, STATUS_DONE, stage="done", finished=_now(), duration_s=round(time.perf_counter() - t0, 1),
                 preview=str(result.preview_mp4) if result.preview_mp4 else None,
@@ -453,6 +474,7 @@ async def process_batch(
                 timings={step: round(seconds, 1) for step, seconds in result.timings.items()},
                 gemini_s=round(result.gemini_seconds, 1),
             )
+            progress.finish("failed", error=message)
             logger.error("Chapitre en echec : %s -> %s", url, message)
         finally:
             # Echec, quota epuise, annulation : le successeur repart quand meme. Sans ce
@@ -462,6 +484,18 @@ async def process_batch(
     for url in urls:
         status.get(url)
     status.save()
+    progress.start(
+        "batch", urls=list(urls), series_order=batch.series_order, predecessors=predecessors,
+        parallel={"prep": batch.max_scrape_workers or batch.max_chapters, "script": batch.max_chapters,
+                  "voice": batch.max_tts_workers, "montage": batch.max_render_workers},
+        montage_steps=[step for step, on in (("timeline", True), ("capcut", options.make_capcut), ("preview", options.make_preview)) if on],
+        figures=options.panels == "figures", upscale=options.panels == "figures" and options.figure_upscale,
+    )
+    for order, url in enumerate(urls):
+        known = status.chapters.get(url) or {}
+        progress.item(url, order=order, status="pending", episode_no=known.get("episode_no") or chapter_ids(url)[1],
+                      title=known.get("title"))
+    progress.phase("chapters")
     await asyncio.gather(*(one(url) for url in urls))
     report.urls = list(urls)
     report.gemini = manager.status()

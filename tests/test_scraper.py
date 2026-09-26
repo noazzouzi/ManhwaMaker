@@ -725,3 +725,21 @@ def test_parse_and_discover_episodes_paginated() -> None:
     assert list(episodes) == [1, 2, 3, 4] and episodes[1].endswith("episode_no=1")
     assert [u for u, _ in session.calls] == [base, base + "&page=2", base + "&page=3"]  # arret des que rien de neuf
     assert discover_episodes(base, session=FakeSession(lambda url: FakeResponse(text="<html></html>", url=url))) == {}
+
+
+def test_html_without_announced_charset_is_read_as_utf8() -> None:
+    from src.modules.scraper import html_text
+
+    page = "<title>Genius Archer’s Streaming</title>".encode("utf-8")
+    latin = FakeResponse(content=page, text=page.decode("latin-1"), headers={"content-type": "text/html"})
+    assert "Archer’s" in html_text(latin)  # requests aurait supposé Latin-1
+    announced = FakeResponse(content=page, text="déclaré", headers={"content-type": "text/html; charset=utf-8"})
+    assert html_text(announced) == "déclaré"  # l'encodage annoncé prime
+    assert html_text(FakeResponse(text="<p>ok</p>")) == "<p>ok</p>"
+
+
+def test_library_repairs_titles_read_as_latin1_by_an_older_scraping() -> None:
+    from src.studio.library import fix_mojibake
+
+    assert fix_mojibake("Genius Archer\xe2\x80\x99s Streaming") == "Genius Archer’s Streaming"
+    assert fix_mojibake("Café ok") == "Café ok" and fix_mojibake(None) is None
