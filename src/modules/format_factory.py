@@ -55,7 +55,8 @@ SHORT_MAX_SILENCE_S: float = 0.1
 #: parle plus vite à la synthèse, la hauteur de voix ne monte donc pas. Elle raccourcit
 #: mécaniquement la vidéo, puisque la durée de chaque paragraphe suit sa narration : les
 #: cases restent calées sur la voix. ``--speed`` sur la ligne de commande continue de primer.
-LONG_SPEED: float = 1.4
+#: 1,4 jusqu'au 26/09, jugé trop rapide.
+LONG_SPEED: float = 1.2
 
 #: Polices d'affichage du mode SHORT, de la plus grasse à la plus sûre. Futura est une
 #: police commerciale, absente de la machine : Montserrat Black (graisse 900, licence

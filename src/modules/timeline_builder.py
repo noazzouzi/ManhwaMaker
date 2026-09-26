@@ -693,7 +693,7 @@ def build_timeline(
                     scene_index=shot.scene_index, panel_index=shot.panel_index, file=shot.file,
                     width=shot.panel_width, height=shot.panel_height,
                     start_s=t, duration_s=shot.duration_s, motion=shot.motion,
-                    crop=shot.crop, subshot=shot.subshot,
+                    crop=shot.crop, subshot=shot.subshot, emotion=scene.emotion,
                 )
             )
             t += shot.duration_s

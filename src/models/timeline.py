@@ -132,6 +132,8 @@ class PanelClip(BaseModel):
         crop: fenêtre affichée dans la case (``None`` = la case entière). Elle porte son
             propre mode de pose, ``cover`` ou ``contain``.
         subshot: rang du plan parmi ceux tirés de la même case (0 = premier).
+        emotion: émotion de la scène (pilote le style du rendu Kdenlive ; vide sur les
+            timelines écrites avant son ajout).
     """
 
     scene_index: int = Field(ge=0)
@@ -145,6 +147,7 @@ class PanelClip(BaseModel):
     transition: ClipTransition | None = None
     crop: CropWindow | None = None
     subshot: int = Field(ge=0, default=0)
+    emotion: str = ""
 
     @property
     def end_s(self) -> float:

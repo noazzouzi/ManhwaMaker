@@ -39,6 +39,7 @@ Interpréteur : `.\.venv\Scripts\python.exe` (jamais `python` nu).
 | voix | `src/modules/tts_engine.py` |
 | montage | `src/modules/timeline_builder.py` |
 | sortie | `src/modules/capcut_builder.py`, `preview_renderer.py` (garder cohérents) |
+| essai Kdenlive (hors pipeline) | `src/modules/kdenlive_builder.py` : projet `.kdenlive` + rendu `melt` sans interface, `python -m src.modules.kdenlive_builder output/<chapitre> --fps 30` (voir `RECHERCHE_EDITEURS_VIDEO.md`) ; style dynamique (transition à chaque coupe selon l'émotion, mouvements variés, impacts, étalonnage) dans `kdenlive_style.py` |
 | lot | `src/modules/batch_processor.py` |
 | decoupe intelligente (test, hors pipeline) | `src/modules/toonsplit/`, `python -m src.modules.toonsplit` (voir `RAPPORT_TOONSPLIT.md`) |
 
@@ -79,6 +80,7 @@ Le profil **SHORT** (9:16) déroge volontairement aux deux premières règles (r
 - `stage_montage` n'a aucun cache : timeline + CapCut + ffmpeg refaits à chaque passage.
 - Mode `figures` (défaut depuis le 24/09) : `scenes.json` reste en numéros de cases de lecture, la traduction vers `figures/` se fait au montage (`remap_analysis`). Extraction ~1,5 min/chapitre en CPU, en cache dans `figures/figures_params.json`. Les personnages d'une même case (même bande horizontale) sont regroupés en une image (`--figures-separate` pour les séparer). Ils sont ensuite agrandis par IA (`upscaler.py`) : ~4 s/chapitre sur GPU, ~85 s en CPU, en cache dans `hd_<L>x<H>/upscale_params.json`. Le zoom ≤ 105 % s'applique à l'image agrandie ; le rythme du montage reste calé sur la taille d'origine (`native_height`). Tri au montage (`select_figures`, décidé le 25/09) : personnage à plus de x3 pour remplir le cadre jamais monté ; personnage hors cases clés du script monté seulement si confiance du détecteur ≥ 0,4 (le détecteur note mal les gros plans, pas plus haut).
 - GPU : le venv utilise `onnxruntime-directml` (Radeon RX 7800 XT) à la place d'`onnxruntime` (même module, jamais les deux). Détection des personnages vérifiée identique (69/69 boîtes). waifu2x donne des images fausses sous DirectML.
+- Essai Kdenlive (26/09, Kdenlive 26.08 installé par winget dans `%LOCALAPPDATA%\Programs\kdenlive`) : chapitre de 5 min 51 rendu par `melt` en 111 s en 30 i/s, 226 s en 60 i/s (aperçu Python : 173 s en 60 i/s). La carte AMD n'encode que la vidéo (`h264_amf`), tous les effets sont calculés par le processeur, et plusieurs `melt` en parallèle ne vont pas plus vite. Les sous-titres ne sont que dans le rendu `melt` : Kdenlive plante sur un filtre de sous-titres écrit à la main (le `.ass` s'importe dans Kdenlive). Les modes de composition des pistes sont perdus à l'ouverture dans Kdenlive : effets superposés en calques transparents. Style dynamique : +50 % de temps de rendu (168 s en 30 i/s pour le même chapitre).
 - `build_capcut_draft` ne reçoit aucun profil → le format SHORT n'est pas exportable vers CapCut.
 - `batch_status.json` est un journal global unique, réécrit sans verrou.
 - PowerShell : pas de `&&`, pas de ternaire. Caractère non-ASCII dans un `print` Python → crash console cp1252.
